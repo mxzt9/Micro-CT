@@ -1,0 +1,14 @@
+numpy
+pandas
+scipy
+scikit-image
+matplotlib
+tqdm
+pygame
+moderngl
+imgui[pygame]
+PyOpenGL
+torch
+porespy
+openpnm
+gudhi
