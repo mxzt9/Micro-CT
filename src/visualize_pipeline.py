@@ -13,6 +13,7 @@ import moderngl
 import numpy as np
 import pygame
 import torch
+from scipy.ndimage import distance_transform_edt, generate_binary_structure, label
 
 from utils import FiLMRoutedUNet3D, extract_porespy_openpnm_network
 
@@ -27,9 +28,10 @@ except ImportError:
 
 
 DEFAULT_SHAPE = (1000, 1000, 1000)
-MODE_NAMES = ("raw", "probability", "mask", "graph")
+MODE_NAMES = ("raw", "probability", "pred mask", "target mask", "error", "critical", "graph")
 GRAPH_COORD_ORDER_KEYS = ("zyx", "xyz")
 GRAPH_COORD_ORDER_LABELS = ("pore.coords z,y,x -> view x,y,z", "pore.coords x,y,z")
+NEIGHBOUR_STRUCT = generate_binary_structure(rank=3, connectivity=1)
 
 
 if PygameRenderer is not None and ProgrammablePipelineRenderer is not None:
@@ -104,6 +106,21 @@ vec3 value_color(float value) {
     if (palette_mode == 2) {
         return mix(vec3(0.0, 0.45, 0.85), vec3(0.2, 1.0, 0.74), value);
     }
+    if (palette_mode == 3) {
+        if (value < 0.66) {
+            return vec3(1.0, 0.22, 0.05);
+        }
+        return vec3(0.55, 0.22, 1.0);
+    }
+    if (palette_mode == 4) {
+        if (value < 0.36) {
+            return vec3(0.18, 0.22, 0.28);
+        }
+        if (value < 0.75) {
+            return vec3(0.0, 0.62, 1.0);
+        }
+        return vec3(1.0, 0.70, 0.08);
+    }
     return vec3(value);
 }
 
@@ -113,6 +130,21 @@ float value_alpha(float value) {
     }
     if (palette_mode == 1) {
         return clamp(value * density * 0.065, 0.0, 0.18);
+    }
+    if (palette_mode == 3) {
+        return value > threshold ? clamp(density * 0.075, 0.0, 0.22) : 0.0;
+    }
+    if (palette_mode == 4) {
+        if (value < threshold) {
+            return 0.0;
+        }
+        if (value < 0.36) {
+            return clamp(density * 0.018, 0.0, 0.06);
+        }
+        if (value < 0.75) {
+            return clamp(density * 0.055, 0.0, 0.18);
+        }
+        return clamp(density * 0.080, 0.0, 0.24);
     }
     return value > threshold ? clamp(density * 0.060, 0.0, 0.20) : 0.0;
 }
@@ -170,8 +202,10 @@ uniform mat3 camera_rot;
 uniform float zoom;
 uniform float window_ratio;
 uniform float point_size;
+uniform float point_radius_scale;
 
 in vec3 in_pos;
+in float in_radius;
 
 void main() {
     vec3 ro = camera_rot * vec3(0.0, 0.0, zoom);
@@ -179,7 +213,7 @@ void main() {
     float perspective = -1.8 / min(camera_pos.z, -0.001);
     vec2 screen = camera_pos.xy * perspective;
     gl_Position = vec4(screen.x / window_ratio, screen.y, 0.0, 1.0);
-    gl_PointSize = point_size;
+    gl_PointSize = point_size + in_radius * point_radius_scale;
 }
 """
 
@@ -188,9 +222,20 @@ GRAPH_FRAGMENT_SHADER = """
 #version 330
 
 uniform vec4 color;
+uniform int sprite_mode;
 out vec4 frag_color;
 
 void main() {
+    if (sprite_mode == 1) {
+        vec2 p = gl_PointCoord * 2.0 - 1.0;
+        float r2 = dot(p, p);
+        if (r2 > 1.0) {
+            discard;
+        }
+        float shade = 0.55 + 0.45 * sqrt(max(0.0, 1.0 - r2));
+        frag_color = vec4(color.rgb * shade, color.a);
+        return;
+    }
     frag_color = color;
 }
 """
@@ -211,11 +256,16 @@ class PipelineState:
     raw: np.ndarray
     origin: tuple[int, int, int]
     threshold: float
+    target_mask: np.ndarray | None = None
     probability: np.ndarray | None = None
     mask: np.ndarray | None = None
     graph_coords: np.ndarray | None = None
     graph_edges: np.ndarray | None = None
+    graph_radii: np.ndarray | None = None
     graph_threshold: float | None = None
+    critical_radius: float | None = None
+    critical_candidate: np.ndarray | None = None
+    critical_cluster: np.ndarray | None = None
     mode: int = 0
     status: str = "raw loaded"
     stage: str = "idle"
@@ -229,6 +279,9 @@ class PipelineState:
 
     def has_mask(self) -> bool:
         return self.mask is not None
+
+    def has_target(self) -> bool:
+        return self.target_mask is not None
 
     def has_graph(self) -> bool:
         return self.graph_coords is not None and self.graph_edges is not None
@@ -244,13 +297,43 @@ class PipelineState:
             if self.probability is None:
                 return np.zeros_like(self.raw, dtype=np.uint8)
             return np.clip(self.probability * 255.0, 0, 255).astype(np.uint8)
-        if self.mode in (2, 3):
+        if self.mode == 2:
             if self.mask is None:
                 return np.zeros_like(self.raw, dtype=np.uint8)
-            if self.mode == 3:
-                return (self.mask.astype(np.uint8) * 90).astype(np.uint8)
             return self.mask.astype(np.uint8) * 255
+        if self.mode == 3:
+            if self.target_mask is None:
+                return np.zeros_like(self.raw, dtype=np.uint8)
+            return self.target_mask.astype(np.uint8) * 255
+        if self.mode == 4:
+            return self.error_volume()
+        if self.mode == 5:
+            return self.critical_volume()
+        if self.mode == 6:
+            if self.mask is None:
+                return np.zeros_like(self.raw, dtype=np.uint8)
+            return (self.mask.astype(np.uint8) * 90).astype(np.uint8)
         return self.raw
+
+    def error_volume(self) -> np.ndarray:
+        out = np.zeros_like(self.raw, dtype=np.uint8)
+        if self.mask is None or self.target_mask is None:
+            return out
+        false_positive = self.mask & ~self.target_mask
+        false_negative = ~self.mask & self.target_mask
+        out[false_positive] = 128
+        out[false_negative] = 255
+        return out
+
+    def critical_volume(self) -> np.ndarray:
+        out = np.zeros_like(self.raw, dtype=np.uint8)
+        if self.mask is not None:
+            out[self.mask] = 45
+        if self.critical_candidate is not None:
+            out[self.critical_candidate] = 150
+        if self.critical_cluster is not None:
+            out[self.critical_cluster] = 255
+        return out
 
     @property
     def pore_fraction(self) -> float:
@@ -367,6 +450,15 @@ def graph_coords_to_view(
     return view_coords.astype("f4")
 
 
+def network_array(pn, keys: tuple[str, ...], default: np.ndarray | float | None = None) -> np.ndarray:
+    for key in keys:
+        if key in pn.keys():
+            return np.asarray(pn[key], dtype=np.float32)
+    if default is None:
+        raise KeyError(f"Missing network properties: {keys}")
+    return np.asarray(default, dtype=np.float32)
+
+
 def extract_graph(mask: np.ndarray, voxel_size: float, sigma: float, r_max: int):
     pn = extract_porespy_openpnm_network(
         pore_mask=mask,
@@ -376,7 +468,45 @@ def extract_graph(mask: np.ndarray, voxel_size: float, sigma: float, r_max: int)
     )
     coords = np.asarray(pn["pore.coords"], dtype=np.float32)
     conns = np.asarray(pn["throat.conns"], dtype=np.int64)
-    return coords, conns
+    diameters = network_array(
+        pn,
+        ("pore.inscribed_diameter", "pore.equivalent_diameter", "pore.diameter"),
+        default=np.ones(coords.shape[0], dtype=np.float32),
+    )
+    radii = 0.5 * np.maximum(diameters, 1.0e-6)
+    return coords, conns, radii.astype(np.float32)
+
+
+def connected_labels(current_label: np.ndarray, axis: int) -> np.ndarray:
+    first = np.take(current_label, 0, axis=axis)
+    last = np.take(current_label, -1, axis=axis)
+    start_labels = np.unique(first)
+    end_labels = np.unique(last)
+    start_labels = start_labels[start_labels != 0]
+    end_labels = end_labels[end_labels != 0]
+    return np.intersect1d(start_labels, end_labels, assume_unique=True)
+
+
+def compute_critical_radius(mask: np.ndarray, axis: int, steps: int):
+    if not mask.any():
+        empty = np.zeros_like(mask, dtype=bool)
+        return 0.0, empty, empty, 0
+
+    radius_map = distance_transform_edt(mask).astype(np.float32)
+    thresholds = np.linspace(float(radius_map.max()), 0.0, max(2, int(steps)), dtype=np.float32)
+    last_candidate = np.zeros_like(mask, dtype=bool)
+
+    for radius in thresholds:
+        candidate = (radius_map >= float(radius)) & mask
+        last_candidate = candidate
+        current_label, groups = label(candidate, structure=NEIGHBOUR_STRUCT)
+        labels = connected_labels(current_label, axis)
+        if labels.size:
+            cluster = np.isin(current_label, labels)
+            return float(radius), candidate, cluster, int(groups)
+
+    empty = np.zeros_like(mask, dtype=bool)
+    return 0.0, last_candidate, empty, 0
 
 
 def prepare_state(args: argparse.Namespace) -> tuple[PipelineState, dict[str, Path | tuple[int, int, int]]]:
@@ -386,8 +516,12 @@ def prepare_state(args: argparse.Namespace) -> tuple[PipelineState, dict[str, Pa
     checkpoint_path = args.checkpoint or root / "models" / "film_routed_unet3d_best.pth"
     origin = sample_origin_from_index(root, args.sample_index, args.cube_size, args.origin)
     raw_cube, origin = load_subcube(raw_path, args.shape, args.cube_size, origin)
+    target_mask = None
+    if binary_path.exists():
+        binary_cube, _ = load_subcube(binary_path, args.shape, args.cube_size, origin)
+        target_mask = binary_cube == int(args.pore_value)
 
-    state = PipelineState(raw=raw_cube, origin=origin, threshold=args.threshold)
+    state = PipelineState(raw=raw_cube, origin=origin, threshold=args.threshold, target_mask=target_mask)
     paths = {
         "root": root,
         "raw": raw_path,
@@ -435,8 +569,11 @@ def start_pipeline_worker(
                 probability = segment_cube(model, state.raw, device)
             elif mask_source == "target":
                 emit("status", "loading target binary mask")
-                binary_cube, _ = load_subcube(paths["binary"], args.shape, args.cube_size, state.origin)
-                probability = (binary_cube == args.pore_value).astype(np.float32)
+                if state.target_mask is not None:
+                    probability = state.target_mask.astype(np.float32)
+                else:
+                    binary_cube, _ = load_subcube(paths["binary"], args.shape, args.cube_size, state.origin)
+                    probability = (binary_cube == args.pore_value).astype(np.float32)
             else:
                 emit("status", "thresholding raw intensity")
                 probability = (state.raw.astype(np.float32) / 255.0 >= args.raw_threshold).astype(np.float32)
@@ -444,11 +581,14 @@ def start_pipeline_worker(
             emit("probability", probability)
             mask = probability >= threshold_snapshot
             emit("mask", mask)
+            emit("status", "computing critical radius")
+            critical = compute_critical_radius(mask, args.percolation_axis, args.critical_steps)
+            emit("critical", critical)
 
             if run_graph and not args.skip_graph:
                 emit("status", "extracting PoreSpy/OpenPNM graph")
-                coords, conns = extract_graph(mask, args.voxel_size, args.sigma, args.r_max)
-                emit("graph", (coords, conns, threshold_snapshot))
+                coords, conns, radii = extract_graph(mask, args.voxel_size, args.sigma, args.r_max)
+                emit("graph", (coords, conns, radii, threshold_snapshot))
 
             emit("status", "done")
         except Exception as error:
@@ -474,8 +614,8 @@ def start_graph_worker(state: PipelineState, args: argparse.Namespace) -> None:
     def worker_loop() -> None:
         try:
             events.put(("status", "extracting PoreSpy/OpenPNM graph"))
-            coords, conns = extract_graph(mask, args.voxel_size, args.sigma, args.r_max)
-            events.put(("graph", (coords, conns, threshold_snapshot)))
+            coords, conns, radii = extract_graph(mask, args.voxel_size, args.sigma, args.r_max)
+            events.put(("graph", (coords, conns, radii, threshold_snapshot)))
             events.put(("status", "done"))
         except Exception as error:
             events.put(("error", str(error)))
@@ -484,6 +624,54 @@ def start_graph_worker(state: PipelineState, args: argparse.Namespace) -> None:
 
     state.worker = threading.Thread(target=worker_loop, daemon=True)
     state.worker.start()
+
+
+def run_pipeline_sync(state: PipelineState, args: argparse.Namespace, paths: dict[str, Any], run_graph: bool = True) -> None:
+    mask_source = resolve_mask_source(args, paths["checkpoint"])
+    state.status = f"mask source: {mask_source}"
+    state.error = None
+    threshold_snapshot = float(state.threshold)
+
+    try:
+        if mask_source == "model":
+            if not paths["checkpoint"].exists():
+                raise FileNotFoundError(f"checkpoint was not found: {paths['checkpoint']}")
+            device = torch.device(args.device or ("cuda" if torch.cuda.is_available() else "cpu"))
+            print(f"Loading segmentation model on {device}...")
+            model = build_segmentation_model(paths["checkpoint"], device, args.base_channels, args.ctx_dim)
+            print("Running segmentation...")
+            probability = segment_cube(model, state.raw, device)
+        elif mask_source == "target":
+            print("Using target binary mask as segmentation.")
+            if state.target_mask is None:
+                binary_cube, _ = load_subcube(paths["binary"], args.shape, args.cube_size, state.origin)
+                state.target_mask = binary_cube == int(args.pore_value)
+            probability = state.target_mask.astype(np.float32)
+        else:
+            print("Using raw threshold as segmentation.")
+            probability = (state.raw.astype(np.float32) / 255.0 >= args.raw_threshold).astype(np.float32)
+
+        state.probability = probability
+        state.mask = probability >= threshold_snapshot
+
+        print("Computing critical radius...")
+        radius, candidate, cluster, _ = compute_critical_radius(state.mask, args.percolation_axis, args.critical_steps)
+        state.critical_radius = radius
+        state.critical_candidate = candidate
+        state.critical_cluster = cluster
+
+        if run_graph and not args.skip_graph:
+            print("Extracting PoreSpy/OpenPNM graph...")
+            coords, conns, radii = extract_graph(state.mask, args.voxel_size, args.sigma, args.r_max)
+            state.graph_coords = coords
+            state.graph_edges = conns
+            state.graph_radii = radii
+            state.graph_threshold = threshold_snapshot
+
+        state.status = "precomputed"
+    except Exception as error:
+        state.error = str(error)
+        state.status = f"error: {error}"
 
 
 def poll_pipeline_events(state: PipelineState) -> tuple[bool, bool]:
@@ -504,16 +692,24 @@ def poll_pipeline_events(state: PipelineState) -> tuple[bool, bool]:
         elif tag == "probability":
             state.probability = np.asarray(payload, dtype=np.float32)
             state.rebuild_mask()
-            if state.mode == 1:
+            if state.mode in (1, 2, 4, 5, 6):
                 texture_dirty = True
         elif tag == "mask":
             state.mask = np.asarray(payload, dtype=bool)
-            if state.mode in (2, 3):
+            if state.mode in (2, 4, 5, 6):
+                texture_dirty = True
+        elif tag == "critical":
+            radius, candidate, cluster, _ = payload
+            state.critical_radius = float(radius)
+            state.critical_candidate = np.asarray(candidate, dtype=bool)
+            state.critical_cluster = np.asarray(cluster, dtype=bool)
+            if state.mode == 5:
                 texture_dirty = True
         elif tag == "graph":
-            coords, conns, graph_threshold = payload
+            coords, conns, radii, graph_threshold = payload
             state.graph_coords = coords
             state.graph_edges = conns
+            state.graph_radii = radii
             state.graph_threshold = float(graph_threshold)
             graph_dirty = True
         elif tag == "error":
@@ -563,14 +759,23 @@ def rebuild_graph_buffers(
         flip_y=bool(settings.get("graph_flip_y", False)),
         flip_z=bool(settings.get("graph_flip_z", False)),
     )
+    if state.graph_radii is None or len(state.graph_radii) != len(view_coords):
+        radii = np.ones(len(view_coords), dtype=np.float32)
+    else:
+        radii = np.asarray(state.graph_radii, dtype=np.float32)
+    radii = radii / max(float(np.percentile(radii, 95)), 1.0e-6)
+    radii = np.clip(radii, 0.15, 2.5).astype("f4")
 
     buffers.point_count = len(view_coords)
-    line_vertices = view_coords[state.graph_edges.reshape(-1)].astype("f4")
+    point_vertices = np.concatenate([view_coords.astype("f4"), radii[:, None]], axis=1)
+    line_positions = view_coords[state.graph_edges.reshape(-1)].astype("f4")
+    line_radii = np.zeros((line_positions.shape[0], 1), dtype="f4")
+    line_vertices = np.concatenate([line_positions, line_radii], axis=1)
     buffers.line_count = len(line_vertices)
-    buffers.point_buffer = ctx.buffer(view_coords.astype("f4").tobytes())
+    buffers.point_buffer = ctx.buffer(point_vertices.tobytes())
     buffers.line_buffer = ctx.buffer(line_vertices.tobytes())
-    buffers.point_vao = ctx.vertex_array(program, [(buffers.point_buffer, "3f", "in_pos")])
-    buffers.line_vao = ctx.vertex_array(program, [(buffers.line_buffer, "3f", "in_pos")])
+    buffers.point_vao = ctx.vertex_array(program, [(buffers.point_buffer, "3f 1f", "in_pos", "in_radius")])
+    buffers.line_vao = ctx.vertex_array(program, [(buffers.line_buffer, "3f 1f", "in_pos", "in_radius")])
     return buffers
 
 
@@ -649,8 +854,19 @@ def render_imgui_panel(state: PipelineState, args: argparse.Namespace, settings:
         state.mode = 2
         texture_dirty = True
     imgui.same_line()
-    if imgui.button("Graph"):
+    if imgui.button("Target"):
         state.mode = 3
+        texture_dirty = True
+    imgui.same_line()
+    if imgui.button("Error"):
+        state.mode = 4
+        texture_dirty = True
+    if imgui.button("Critical"):
+        state.mode = 5
+        texture_dirty = True
+    imgui.same_line()
+    if imgui.button("Graph"):
+        state.mode = 6
         texture_dirty = True
 
     imgui.separator()
@@ -676,9 +892,25 @@ def render_imgui_panel(state: PipelineState, args: argparse.Namespace, settings:
         settings["graph_flip_z"] = bool(flip_z)
         graph_dirty = True
 
+    changed, point_radius_scale = imgui.slider_float(
+        "Pore sphere scale",
+        float(settings["point_radius_scale"]),
+        0.0,
+        18.0,
+        "%.1f",
+    )
+    if changed:
+        settings["point_radius_scale"] = float(point_radius_scale)
+
     imgui.separator()
     imgui.text(f"Probability: {'yes' if state.has_probability() else 'no'}")
     imgui.text(f"Mask: {'yes' if state.has_mask() else 'no'}")
+    imgui.text(f"Target: {'yes' if state.has_target() else 'no'}")
+    if state.mask is not None and state.target_mask is not None:
+        error_rate = float(np.logical_xor(state.mask, state.target_mask).mean())
+        imgui.text(f"Voxel error: {error_rate:.4f}")
+    if state.critical_radius is not None:
+        imgui.text(f"Critical radius: {state.critical_radius:.3f} vox")
     if state.has_graph():
         imgui.text(f"Graph pores: {len(state.graph_coords)}")
         imgui.text(f"Graph throats: {len(state.graph_edges)}")
@@ -725,7 +957,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--voxel-size", type=float, default=2.25e-6)
     parser.add_argument("--sigma", type=float, default=0.4)
     parser.add_argument("--r-max", type=int, default=4)
+    parser.add_argument("--percolation-axis", type=int, choices=(0, 1, 2), default=0, help="critical radius axis: 0=z, 1=y, 2=x")
+    parser.add_argument("--critical-steps", type=int, default=80)
     parser.add_argument("--skip-graph", action="store_true")
+    parser.add_argument("--realtime", action="store_true", help="open window immediately and compute stages in background")
     parser.add_argument("--no-auto-run", action="store_true", help="show raw cube first and wait for UI button")
     parser.add_argument("--no-imgui", action="store_true", help="disable imgui panel")
     parser.add_argument("--base-channels", type=int, default=16)
@@ -739,6 +974,9 @@ def build_parser() -> argparse.ArgumentParser:
 def main() -> None:
     args = build_parser().parse_args()
     state, paths = prepare_state(args)
+
+    if not args.realtime and not args.no_auto_run:
+        run_pipeline_sync(state, args, paths, run_graph=not args.skip_graph)
 
     pygame.init()
     pygame.display.set_mode(
@@ -764,6 +1002,7 @@ def main() -> None:
     settings: dict[str, Any] = {
         "density": 5.0,
         "draw_threshold": 0.08,
+        "point_radius_scale": 10.0,
         "graph_coord_order": GRAPH_COORD_ORDER_KEYS.index(args.graph_coord_order),
         "graph_flip_x": bool(args.flip_graph_x),
         "graph_flip_y": bool(args.flip_graph_y),
@@ -777,11 +1016,14 @@ def main() -> None:
     texture_dirty = False
 
     print("Controls:")
-    print("  1 raw, 2 probability, 3 mask, 4 graph")
+    print("  1 raw, 2 probability, 3 pred mask, 4 target, 5 error, 6 critical, 7 graph")
     print("  mouse drag rotate, wheel zoom, +/- density, </> raw draw threshold, R reset, Esc quit")
     print("  imgui: run full pipeline, graph only, threshold/density sliders")
 
-    if not args.no_auto_run:
+    if state.has_graph():
+        graph_buffers = rebuild_graph_buffers(ctx, graph_program, state, settings)
+
+    if args.realtime and not args.no_auto_run:
         start_pipeline_worker(state, args, paths, run_graph=not args.skip_graph)
 
     clock = pygame.time.Clock()
@@ -803,7 +1045,15 @@ def main() -> None:
             elif event.type == pygame.KEYDOWN and not capture_keyboard:
                 if event.key == pygame.K_ESCAPE:
                     running = False
-                elif event.key in (pygame.K_1, pygame.K_2, pygame.K_3, pygame.K_4):
+                elif event.key in (
+                    pygame.K_1,
+                    pygame.K_2,
+                    pygame.K_3,
+                    pygame.K_4,
+                    pygame.K_5,
+                    pygame.K_6,
+                    pygame.K_7,
+                ):
                     state.mode = event.key - pygame.K_1
                     texture_dirty = True
                 elif event.key in (pygame.K_PLUS, pygame.K_EQUALS):
@@ -870,21 +1120,34 @@ def main() -> None:
         volume_program["camera_rot"].write(rot.tobytes())
         volume_program["zoom"].value = zoom
         volume_program["density"].value = (
-            float(settings["density"]) if state.mode != 3 else max(1.2, float(settings["density"]) * 0.45)
+            float(settings["density"]) if state.mode != 6 else max(1.2, float(settings["density"]) * 0.45)
         )
         volume_program["threshold"].value = float(settings["draw_threshold"]) if state.mode == 0 else 0.02
         volume_program["window_ratio"].value = ratio
-        volume_program["palette_mode"].value = min(state.mode, 2)
+        if state.mode == 1:
+            palette_mode = 1
+        elif state.mode == 4:
+            palette_mode = 3
+        elif state.mode == 5:
+            palette_mode = 4
+        elif state.mode in (2, 3, 6):
+            palette_mode = 2
+        else:
+            palette_mode = 0
+        volume_program["palette_mode"].value = palette_mode
         quad_vao.render(moderngl.TRIANGLE_STRIP)
 
-        if state.mode == 3 and graph_buffers.line_vao is not None and graph_buffers.point_vao is not None:
+        if state.mode == 6 and graph_buffers.line_vao is not None and graph_buffers.point_vao is not None:
             graph_program["camera_rot"].write(rot.tobytes())
             graph_program["zoom"].value = zoom
             graph_program["window_ratio"].value = ratio
             graph_program["point_size"].value = 6.5
+            graph_program["point_radius_scale"].value = float(settings["point_radius_scale"])
             graph_program["color"].value = (0.08, 0.78, 1.0, 0.75)
+            graph_program["sprite_mode"].value = 0
             graph_buffers.line_vao.render(moderngl.LINES, vertices=graph_buffers.line_count)
             graph_program["color"].value = (1.0, 0.82, 0.18, 0.95)
+            graph_program["sprite_mode"].value = 1
             graph_buffers.point_vao.render(moderngl.POINTS, vertices=graph_buffers.point_count)
 
         if imgui_impl is not None:
