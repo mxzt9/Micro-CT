@@ -42,8 +42,11 @@ def dice_score_from_logits(
     smooth: float = 1e-6,
 ) -> torch.Tensor:
     preds = (torch.sigmoid(logits) >= threshold).float()
-    intersection = (preds * targets).sum()
-    return (2.0 * intersection + smooth) / (preds.sum() + targets.sum() + smooth)
+    preds = preds.flatten(1)
+    targets = targets.flatten(1)
+    intersection = (preds * targets).sum(dim=1)
+    dice = (2.0 * intersection + smooth) / (preds.sum(dim=1) + targets.sum(dim=1) + smooth)
+    return dice.mean()
 
 
 def embedding_consistency_loss(embeddings: list[torch.Tensor] | tuple[torch.Tensor, ...]) -> torch.Tensor:

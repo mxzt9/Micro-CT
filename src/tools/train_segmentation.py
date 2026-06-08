@@ -17,6 +17,7 @@ from utils import (  # noqa: E402
     BCEDiceLoss,
     DEFAULT_CUBE_SIZES,
     BereaPatchDataset,
+    CubeSizeBatchSampler,
     FiLMRoutedUNet3D,
     auxiliary_physics_loss,
     dice_score_from_logits,
@@ -34,15 +35,38 @@ def parse_weights(value: str | None) -> dict[int, float] | None:
     return result
 
 
-def make_loader(dataset, batch_size: int, shuffle: bool, num_workers: int, pin_memory: bool) -> DataLoader:
+def parse_int_map(value: str | None) -> dict[int, int] | None:
+    if not value:
+        return None
+    result: dict[int, int] = {}
+    for item in value.split(","):
+        size, count = item.split(":")
+        result[int(size)] = int(count)
+    return result
+
+
+def make_loader(
+    dataset,
+    batch_size: int | dict[int, int],
+    shuffle: bool,
+    num_workers: int,
+    pin_memory: bool,
+    *,
+    seed: int,
+) -> DataLoader:
     kwargs = {
-        "batch_size": batch_size,
-        "shuffle": shuffle,
         "num_workers": num_workers,
         "pin_memory": pin_memory,
     }
     if num_workers > 0:
         kwargs.update({"persistent_workers": True, "prefetch_factor": 2})
+    if hasattr(dataset, "df") and hasattr(dataset, "sample_index") and "cube_size" in dataset.df.columns:
+        sampler = CubeSizeBatchSampler(dataset, batch_size=batch_size, shuffle=shuffle, seed=seed)
+        kwargs["batch_sampler"] = sampler
+    else:
+        if isinstance(batch_size, dict):
+            raise TypeError("per-cube batch sizes require a BereaPatchDataset-like dataset")
+        kwargs.update({"batch_size": batch_size, "shuffle": shuffle})
     return DataLoader(dataset, **kwargs)
 
 
@@ -108,6 +132,11 @@ def main() -> None:
     parser.add_argument("--max-val-batches", type=int, default=16)
     parser.add_argument("--epochs", type=int, default=10)
     parser.add_argument("--batch-size", type=int, default=1)
+    parser.add_argument(
+        "--batch-size-by-cube-size",
+        default=None,
+        help="Optional mapping like 64:8,128:2,192:1. Keeps each batch at one cube size.",
+    )
     parser.add_argument("--num-workers", type=int, default=2)
     parser.add_argument("--base-channels", type=int, default=16)
     parser.add_argument("--ctx-dim", type=int, default=64)
@@ -127,6 +156,7 @@ def main() -> None:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     args.amp = not args.no_amp
     pin_memory = device.type == "cuda"
+    loader_batch_size = parse_int_map(args.batch_size_by_cube_size) or args.batch_size
     args.checkpoint.parent.mkdir(parents=True, exist_ok=True)
 
     train_ds = BereaPatchDataset(
@@ -145,8 +175,8 @@ def main() -> None:
         balance=False,
         samples_per_group=args.samples_per_group,
     )
-    train_loader = make_loader(train_ds, args.batch_size, True, args.num_workers, pin_memory)
-    val_loader = make_loader(val_ds, args.batch_size, False, args.num_workers, pin_memory)
+    train_loader = make_loader(train_ds, loader_batch_size, True, args.num_workers, pin_memory, seed=42)
+    val_loader = make_loader(val_ds, loader_batch_size, False, args.num_workers, pin_memory, seed=43)
 
     model = FiLMRoutedUNet3D(base_channels=args.base_channels, ctx_dim=args.ctx_dim).to(device)
     criterion = BCEDiceLoss()

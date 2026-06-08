@@ -9,7 +9,7 @@ import numpy as np
 import pandas as pd
 import torch
 from scipy.ndimage import generate_binary_structure, label
-from torch.utils.data import Dataset
+from torch.utils.data import Dataset, Sampler
 
 
 DEFAULT_CUBE_SIZES = (64, 128, 192)
@@ -527,14 +527,18 @@ class BereaPatchDataset(Dataset):
 
     @staticmethod
     def normalize_uint8(cube: np.ndarray) -> np.ndarray:
-        return cube.astype(np.float32) / 255.0
+        normalized = cube.astype(np.float32, copy=True)
+        normalized *= 1.0 / 255.0
+        return normalized
 
     def add_noise(self, cube: np.ndarray, noise_type: str) -> np.ndarray:
-        img = cube.copy().astype(np.float32)
-
         if noise_type == "none":
-            pass
-        elif noise_type == "gaussian_low":
+            return cube if cube.dtype == np.float32 else cube.astype(np.float32, copy=True)
+
+        img = cube.astype(np.float32, copy=True)
+        should_clip = True
+
+        if noise_type == "gaussian_low":
             img += self.rng.normal(0.0, 0.03, size=img.shape).astype(np.float32)
         elif noise_type == "gaussian_mid":
             img += self.rng.normal(0.0, 0.06, size=img.shape).astype(np.float32)
@@ -545,11 +549,14 @@ class BereaPatchDataset(Dataset):
             mask = self.rng.random(img.shape)
             img[mask < prob / 2] = 0.0
             img[(mask >= prob / 2) & (mask < prob)] = 1.0
+            should_clip = False
         elif noise_type == "contrast_shift":
-            img = img * self.rng.uniform(0.75, 1.25) + self.rng.uniform(-0.10, 0.10)
+            img *= float(self.rng.uniform(0.75, 1.25))
+            img += float(self.rng.uniform(-0.10, 0.10))
         elif noise_type == "mixed":
             img += self.rng.normal(0.0, 0.05, size=img.shape).astype(np.float32)
-            img = img * self.rng.uniform(0.8, 1.2) + self.rng.uniform(-0.08, 0.08)
+            img *= float(self.rng.uniform(0.8, 1.2))
+            img += float(self.rng.uniform(-0.08, 0.08))
             prob = 0.01
             mask = self.rng.random(img.shape)
             img[mask < prob / 2] = 0.0
@@ -557,7 +564,9 @@ class BereaPatchDataset(Dataset):
         else:
             raise ValueError(f"unknown noise type: {noise_type}")
 
-        return np.clip(img, 0.0, 1.0).astype(np.float32)
+        if should_clip:
+            np.clip(img, 0.0, 1.0, out=img)
+        return img
 
     def get_cube(self, idx: int) -> dict[str, Any]:
         row = self.df.iloc[int(self.sample_index[idx])]
@@ -598,8 +607,8 @@ class BereaPatchDataset(Dataset):
             percolates = np.zeros(3, dtype=np.float32)
 
         return {
-            "x": torch.from_numpy(noisy_x.copy()).float().unsqueeze(0),
-            "y": torch.from_numpy(target.copy()).float().unsqueeze(0),
+            "x": torch.from_numpy(noisy_x).unsqueeze(0),
+            "y": torch.from_numpy(target).unsqueeze(0),
             "coord": torch.tensor(cube["coord"], dtype=torch.long),
             "rock": cube["rock"],
             "cube_size": torch.tensor(cube["cube_size"], dtype=torch.long),
@@ -607,6 +616,82 @@ class BereaPatchDataset(Dataset):
             "percolates": torch.tensor(percolates, dtype=torch.float32),
             "noise": str(noise_type),
         }
+
+
+class CubeSizeBatchSampler(Sampler[list[int]]):
+    """Yield batches whose samples all have the same cube_size."""
+
+    def __init__(
+        self,
+        dataset: BereaPatchDataset,
+        batch_size: int | dict[int, int],
+        *,
+        shuffle: bool = True,
+        drop_last: bool = False,
+        seed: int = 42,
+    ):
+        if not hasattr(dataset, "df") or not hasattr(dataset, "sample_index"):
+            raise TypeError("CubeSizeBatchSampler expects a BereaPatchDataset-like object")
+        self.dataset = dataset
+        self.batch_size = batch_size
+        self.shuffle = bool(shuffle)
+        self.drop_last = bool(drop_last)
+        self.seed = int(seed)
+        self.epoch = 0
+
+        if isinstance(batch_size, dict):
+            self.batch_size_by_size = {int(size): int(value) for size, value in batch_size.items()}
+            if any(value <= 0 for value in self.batch_size_by_size.values()):
+                raise ValueError("batch_size values must be positive")
+        else:
+            if int(batch_size) <= 0:
+                raise ValueError("batch_size must be positive")
+            self.batch_size_by_size = {}
+            self.default_batch_size = int(batch_size)
+
+        effective = dataset.df.iloc[dataset.sample_index].reset_index(drop=True)
+        self.indices_by_size = {
+            int(size): group.index.to_numpy(dtype=np.int64)
+            for size, group in effective.groupby("cube_size", sort=True)
+        }
+        if not self.indices_by_size:
+            raise ValueError("dataset has no samples to batch")
+
+        unknown_sizes = set(self.indices_by_size) - set(self.batch_size_by_size)
+        if isinstance(batch_size, dict) and unknown_sizes:
+            raise ValueError(f"batch_size is missing cube sizes: {sorted(unknown_sizes)}")
+
+    def _batch_size_for(self, cube_size: int) -> int:
+        if int(cube_size) in self.batch_size_by_size:
+            return self.batch_size_by_size[int(cube_size)]
+        return self.default_batch_size
+
+    def __iter__(self):
+        rng = np.random.default_rng(self.seed + self.epoch)
+        batches: list[list[int]] = []
+        for size, indices in self.indices_by_size.items():
+            indices = indices.copy()
+            if self.shuffle:
+                rng.shuffle(indices)
+            batch_size = self._batch_size_for(size)
+            for start in range(0, len(indices), batch_size):
+                batch = indices[start : start + batch_size].tolist()
+                if len(batch) == batch_size or (batch and not self.drop_last):
+                    batches.append(batch)
+        if self.shuffle:
+            rng.shuffle(batches)
+        self.epoch += 1
+        return iter(batches)
+
+    def __len__(self) -> int:
+        total = 0
+        for size, indices in self.indices_by_size.items():
+            batch_size = self._batch_size_for(size)
+            full, remainder = divmod(len(indices), batch_size)
+            total += full
+            if remainder and not self.drop_last:
+                total += 1
+        return total
 
 
 def percolation_labels(mask: np.ndarray) -> np.ndarray:

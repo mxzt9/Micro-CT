@@ -135,9 +135,9 @@ class DigitalCorePipeline:
                     overlap=self.sliding_overlap,
                     ph_features=ph_features,
                 )
-                aux_outputs = self.segmentation_model(tensor, ph_features=ph_features, return_dict=True)
-                embeddings = aux_outputs.get("decoder_embedding")
-                rock_embedding = aux_outputs.get("rock_embedding")
+                aux_outputs = None
+                embeddings = None
+                rock_embedding = None
             else:
                 output = self.segmentation_model(tensor, ph_features=ph_features, return_dict=True)
                 if isinstance(output, dict):

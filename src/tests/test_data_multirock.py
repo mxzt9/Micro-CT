@@ -2,13 +2,17 @@ from __future__ import annotations
 
 import numpy as np
 import pandas as pd
+import torch
+from torch.utils.data import DataLoader
 
 from utils import (
     DEFAULT_CUBE_SIZES,
     BereaPatchDataset,
+    CubeSizeBatchSampler,
     MultiScaleNoiseConsistencyDataset,
     build_patch_index,
     discover_rock_volumes,
+    dice_score_from_logits,
     percolation_labels,
     write_patch_indices,
 )
@@ -97,6 +101,23 @@ def test_default_cube_sizes_are_pooling_safe_and_percolation_labels():
     mask = np.zeros((8, 8, 8), dtype=bool)
     mask[:, 3, 3] = True
     assert percolation_labels(mask).tolist() == [1.0, 0.0, 0.0]
+
+
+def test_dice_score_from_logits_averages_per_sample_not_voxels():
+    logits = torch.tensor(
+        [
+            [[[[10.0, -10.0]]]],
+            [[[[10.0, -10.0]]]],
+        ]
+    )
+    targets = torch.tensor(
+        [
+            [[[[1.0, 0.0]]]],
+            [[[[0.0, 1.0]]]],
+        ]
+    )
+
+    assert torch.isclose(dice_score_from_logits(logits, targets), torch.tensor(0.5))
 
 
 def test_multiscale_consistency_dataset_returns_centered_views(tmp_path):
@@ -204,3 +225,34 @@ def test_size_sampling_weights_reduce_expensive_size(tmp_path):
 
     counts = effective.groupby("cube_size").size().to_dict()
     assert counts[4] > counts[6]
+
+
+def test_cube_size_batch_sampler_keeps_batch_shapes_stackable(tmp_path):
+    shape = (8, 8, 8)
+    _write_raw_pair(tmp_path, "sandstone", shape)
+    index_dir = tmp_path / "datasets" / "sandstone"
+    index_dir.mkdir(parents=True, exist_ok=True)
+    for size in (4, 6):
+        pd.DataFrame(
+            [
+                {"z": 0, "y": 0, "x": 0, "split": "train", "cube_size": size, "rock": "sandstone"},
+                {"z": 0, "y": 0, "x": 1, "split": "train", "cube_size": size, "rock": "sandstone"},
+            ]
+        ).to_csv(index_dir / f"index_{size}.csv", index=False)
+
+    dataset = BereaPatchDataset(
+        tmp_path,
+        split="train",
+        cube_size=[4, 6],
+        shape=shape,
+        noise_types=["none"],
+        balance=False,
+    )
+    sampler = CubeSizeBatchSampler(dataset, batch_size={4: 2, 6: 1}, shuffle=False)
+    loader = DataLoader(dataset, batch_sampler=sampler, num_workers=0)
+
+    batches = list(loader)
+
+    assert [tuple(batch["x"].shape[-3:]) for batch in batches] == [(4, 4, 4), (6, 6, 6), (6, 6, 6)]
+    assert [batch["x"].shape[0] for batch in batches] == [2, 1, 1]
+    assert all(batch["cube_size"].unique().numel() == 1 for batch in batches)
