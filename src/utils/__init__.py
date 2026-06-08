@@ -1,12 +1,41 @@
-from .common import ConvGNAct3D, DoubleConv3D, UNet3D
-from .data import BereaPatchDataset, BereaSegmentationDataset
+from .common import (
+    ConvGNAct3D,
+    DoubleConv3D,
+    UNet3D,
+    match_size,
+    pad_to_multiple_3d,
+    safe_concat,
+    sliding_window_inference_3d,
+    unpad_3d,
+)
+from .data import (
+    DEFAULT_CUBE_SIZES,
+    BereaPatchDataset,
+    BereaSegmentationDataset,
+    MultiScaleNoiseConsistencyDataset,
+    MultiScalePatchDataset,
+    MultiRockPatchDataset,
+    RockVolumeSpec,
+    build_patch_index,
+    discover_rock_volumes,
+    resolve_patch_index_path,
+    percolation_labels,
+    write_patch_indices,
+)
 from .dependencies import check_required_dependencies, require_gudhi
 from .film_routing import ContextSources3D, FiLMRoutedUNet3D, FiLMRouter
-from .losses import BCEDiceLoss, DiceLoss, dice_score_from_logits
+from .losses import (
+    BCEDiceLoss,
+    DiceLoss,
+    auxiliary_physics_loss,
+    dice_score_from_logits,
+    embedding_consistency_loss,
+)
 from .network import (
     PoreNetworkData,
     calculate_openpnm_stokes_permeability,
     extract_porespy_openpnm_network,
+    graph_topology_features,
     openpnm_to_pore_network_data,
     persistent_homology_summary,
 )
@@ -18,6 +47,7 @@ __all__ = [
     "BCEDiceLoss",
     "BereaPatchDataset",
     "BereaSegmentationDataset",
+    "DEFAULT_CUBE_SIZES",
     "ContextSources3D",
     "ConvGNAct3D",
     "DiceLoss",
@@ -28,18 +58,35 @@ __all__ = [
     "FiLMRoutedUNet3D",
     "FiLMRouter",
     "MetricTracker",
+    "MultiScaleNoiseConsistencyDataset",
+    "MultiScalePatchDataset",
+    "MultiRockPatchDataset",
     "PermeabilityResult",
     "PipelineResult",
     "PoreNetworkData",
     "PoreNetworkPermeabilityModel",
+    "RockVolumeSpec",
     "SegmentationResult",
     "ThroatConductanceGNN",
     "UNet3D",
+    "auxiliary_physics_loss",
+    "build_patch_index",
     "calculate_openpnm_stokes_permeability",
     "check_required_dependencies",
     "dice_score_from_logits",
+    "discover_rock_volumes",
+    "embedding_consistency_loss",
     "extract_porespy_openpnm_network",
+    "graph_topology_features",
     "openpnm_to_pore_network_data",
     "persistent_homology_summary",
+    "percolation_labels",
+    "match_size",
+    "pad_to_multiple_3d",
     "require_gudhi",
+    "resolve_patch_index_path",
+    "safe_concat",
+    "sliding_window_inference_3d",
+    "unpad_3d",
+    "write_patch_indices",
 ]

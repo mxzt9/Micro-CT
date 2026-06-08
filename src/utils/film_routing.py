@@ -7,13 +7,13 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 try:
-    from .common import DoubleConv3D
-except ImportError:  # pragma: no cover - прямой запуск из папки пакета
-    from common import DoubleConv3D
+    from .common import DoubleConv3D, pad_to_multiple_3d, safe_concat, unpad_3d
+except ImportError:  # pragma: no cover
+    from common import DoubleConv3D, pad_to_multiple_3d, safe_concat, unpad_3d
 
 
 class ContextSources3D(nn.Module):
-    """Собирает четыре компактных источника контекста для FiLM-маршрутизации."""
+    """Build compact context sources for FiLM routing."""
 
     def __init__(self, enc1_ch: int, bottleneck_ch: int, ctx_dim: int = 64, ph_dim: int = 0):
         super().__init__()
@@ -70,7 +70,7 @@ class ContextSources3D(nn.Module):
 
 
 class FiLMRouter(nn.Module):
-    """Обучаемая маршрутизация alpha[level, source] и FiLM-головы по уровням."""
+    """Static alpha router with per-level FiLM heads."""
 
     def __init__(
         self,
@@ -122,7 +122,7 @@ def film_modulate(h: torch.Tensor, gamma: torch.Tensor, beta: torch.Tensor) -> t
 
 
 class FiLMRoutedUNet3D(nn.Module):
-    """UNet3D с послойной FiLM-маршрутизацией по четырем источникам контекста."""
+    """3D U-Net with FiLM routing, safe variable-size handling, and aux heads."""
 
     def __init__(
         self,
@@ -132,10 +132,13 @@ class FiLMRoutedUNet3D(nn.Module):
         ctx_dim: int = 64,
         ph_dim: int = 0,
         return_embeddings: bool = True,
+        rock_embedding_dim: int = 128,
+        topology_dim: int = 8,
     ):
         super().__init__()
         bc = base_channels
         self.return_embeddings = return_embeddings
+        self.rock_embedding_dim = rock_embedding_dim
 
         self.enc1 = DoubleConv3D(in_channels, bc)
         self.pool1 = nn.MaxPool3d(2)
@@ -156,24 +159,54 @@ class FiLMRoutedUNet3D(nn.Module):
         self.dec1 = DoubleConv3D(bc * 2, bc)
         self.out_conv = nn.Conv3d(bc, out_channels, 1)
 
-    def forward(self, x: torch.Tensor, ph_features: Optional[torch.Tensor] = None):
+        self.rock_embedding_head = nn.Sequential(
+            nn.Linear(bc * 8, rock_embedding_dim),
+            nn.LayerNorm(rock_embedding_dim),
+            nn.ReLU(inplace=True),
+        )
+        self.porosity_head = nn.Linear(rock_embedding_dim, 1)
+        self.percolation_head = nn.Linear(rock_embedding_dim, 3)
+        self.topology_head = nn.Linear(rock_embedding_dim, topology_dim)
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        ph_features: Optional[torch.Tensor] = None,
+        return_dict: bool = False,
+    ):
+        x, pad = pad_to_multiple_3d(x, multiple=8)
         e1 = self.enc1(x)
         e2 = self.enc2(self.pool1(e1))
         e3 = self.enc3(self.pool2(e2))
         bottleneck = self.bottleneck(self.pool3(e3))
 
+        bottleneck_global = bottleneck.mean(dim=(2, 3, 4))
+        rock_embedding = self.rock_embedding_head(bottleneck_global)
+
         ctx = self.context(x, e1, bottleneck, ph_features)
         (g1, b1), (g2, b2), (g3, b3), (g4, b4) = self.router(ctx)
 
         bottleneck = film_modulate(bottleneck, g1, b1)
-        d3 = self.dec3(torch.cat([self.up3(bottleneck), e3], dim=1))
+        d3 = self.dec3(safe_concat(e3, self.up3(bottleneck)))
         d3 = film_modulate(d3, g2, b2)
-        d2 = self.dec2(torch.cat([self.up2(d3), e2], dim=1))
+        d2 = self.dec2(safe_concat(e2, self.up2(d3)))
         d2 = film_modulate(d2, g3, b3)
-        d1 = self.dec1(torch.cat([self.up1(d2), e1], dim=1))
+        d1 = self.dec1(safe_concat(e1, self.up1(d2)))
         d1 = film_modulate(d1, g4, b4)
 
-        logits = self.out_conv(d1)
+        logits = unpad_3d(self.out_conv(d1), pad)
+        decoder_embedding = unpad_3d(d1, pad)
+        output = {
+            "logits": logits,
+            "rock_embedding": rock_embedding,
+            "decoder_embedding": decoder_embedding,
+            "router_alpha": self.router.alpha(),
+            "porosity_logit": self.porosity_head(rock_embedding).squeeze(-1),
+            "percolation_logits": self.percolation_head(rock_embedding),
+            "topology_logits": self.topology_head(rock_embedding),
+        }
+        if return_dict:
+            return output
         if self.return_embeddings:
-            return logits, d1
+            return logits, decoder_embedding
         return logits

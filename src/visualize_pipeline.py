@@ -15,7 +15,7 @@ import pygame
 import torch
 from scipy.ndimage import distance_transform_edt, generate_binary_structure, label
 
-from utils import FiLMRoutedUNet3D, extract_porespy_openpnm_network
+from utils import FiLMRoutedUNet3D, discover_rock_volumes, extract_porespy_openpnm_network, resolve_patch_index_path
 
 try:
     import imgui
@@ -355,9 +355,11 @@ def parse_zyx(text: str) -> tuple[int, int, int]:
 
 def find_project_root(start: Path) -> Path:
     for candidate in (start, *start.parents):
-        if (candidate / "src" / "utils").is_dir() and (candidate / "data").is_dir():
+        if (candidate / "src" / "utils").is_dir() and any(
+            (candidate / marker).exists() for marker in ("data", "datasets", "models", "outputs")
+        ):
             return candidate
-    raise RuntimeError("Project root with src/utils and data was not found")
+    raise RuntimeError("Project root with src/utils and project assets was not found")
 
 
 def clamp_int(value: int, low: int, high: int) -> int:
@@ -381,23 +383,52 @@ def load_subcube(path: Path, shape: tuple[int, int, int], cube_size: int, origin
     return cube, origin
 
 
-def sample_origin_from_index(root: Path, sample_index: int, cube_size: int, fallback: tuple[int, int, int] | None):
-    index_path = root / "dataset_128" / "index_128.csv"
-    if sample_index < 0 or not index_path.exists():
+def sample_origin_from_index(
+    root: Path,
+    sample_index: int,
+    cube_size: int,
+    fallback: tuple[int, int, int] | None,
+    rock: str | None = None,
+    index_root: Path | None = None,
+):
+    if sample_index < 0:
         return fallback
 
     import pandas as pd
 
+    rock_name = rock or "Berea"
+    index_dirs = []
+    if index_root is not None:
+        index_dirs.append(index_root / rock_name)
+    index_dirs.extend([root / "datasets" / rock_name, root / "dataset_128"])
+
+    index_path = None
+    for candidate_dir in index_dirs:
+        index_path = resolve_patch_index_path(candidate_dir, cube_size, rock_name)
+        if index_path is not None:
+            break
+    if index_path is None:
+        return fallback
+
     df = pd.read_csv(index_path)
+    if "cube_size" in df.columns:
+        df = df[df["cube_size"].astype(int) == int(cube_size)].reset_index(drop=True)
     if sample_index >= len(df):
-        raise ValueError(f"sample_index {sample_index} is outside index_128.csv")
+        raise ValueError(f"sample_index {sample_index} is outside {index_path}")
 
     row = df.iloc[sample_index]
     base = (int(row["z"]), int(row["y"]), int(row["x"]))
-    if cube_size >= 128:
+
+    index_size = int(row["cube_size"]) if "cube_size" in row else cube_size
+    if index_path.stem.startswith("index_"):
+        try:
+            index_size = int(index_path.stem.split("_")[-1])
+        except ValueError:
+            pass
+    if cube_size >= index_size:
         return base
 
-    shift = (128 - cube_size) // 2
+    shift = (index_size - cube_size) // 2
     return tuple(value + shift for value in base)
 
 
@@ -414,8 +445,11 @@ def build_segmentation_model(checkpoint_path: Path, device: torch.device, base_c
 def segment_cube(model: torch.nn.Module, raw_cube: np.ndarray, device: torch.device) -> np.ndarray:
     x = torch.from_numpy(raw_cube.astype(np.float32) / 255.0).unsqueeze(0).unsqueeze(0).to(device)
     with torch.no_grad():
-        output = model(x)
-        logits = output[0] if isinstance(output, tuple) else output
+        output = model(x, return_dict=True)
+        if isinstance(output, dict):
+            logits = output["logits"]
+        else:
+            logits = output[0] if isinstance(output, tuple) else output
         probability = torch.sigmoid(logits)[0, 0].detach().cpu().numpy()
     return probability.astype(np.float32)
 
@@ -511,10 +545,26 @@ def compute_critical_radius(mask: np.ndarray, axis: int, steps: int):
 
 def prepare_state(args: argparse.Namespace) -> tuple[PipelineState, dict[str, Path | tuple[int, int, int]]]:
     root = find_project_root(Path.cwd())
-    raw_path = args.raw or root / "data" / "Berea_2d25um_grayscale_filtered.raw"
-    binary_path = args.binary or root / "data" / "Berea_2d25um_binary.raw"
+    try:
+        specs = discover_rock_volumes(root, rocks=[args.rock] if args.rock else None, shape=args.shape)
+    except (FileNotFoundError, KeyError) as error:
+        if args.rock:
+            raise FileNotFoundError(
+                f"rock '{args.rock}' was not found under {root / 'data'}. "
+                "Pass --raw/--binary explicitly or place raw volumes under data/<rock>/."
+            ) from error
+        specs = []
+    spec = specs[0] if specs else None
+
+    raw_path = args.raw or (spec.gray_path if spec is not None else root / "data" / "Berea_2d25um_grayscale_filtered.raw")
+    binary_path = args.binary or (spec.binary_path if spec is not None else root / "data" / "Berea_2d25um_binary.raw")
     checkpoint_path = args.checkpoint or root / "models" / "film_routed_unet3d_best.pth"
-    origin = sample_origin_from_index(root, args.sample_index, args.cube_size, args.origin)
+    if not raw_path.exists():
+        raise FileNotFoundError(
+            f"raw volume was not found: {raw_path}. "
+            "Place volumes under data/, choose --rock, or pass --raw PATH with the matching --shape."
+        )
+    origin = sample_origin_from_index(root, args.sample_index, args.cube_size, args.origin, args.rock, args.index_root)
     raw_cube, origin = load_subcube(raw_path, args.shape, args.cube_size, origin)
     target_mask = None
     if binary_path.exists():
@@ -937,9 +987,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--raw", type=Path, help="path to grayscale uint8 raw volume")
     parser.add_argument("--binary", type=Path, help="path to binary uint8 raw volume")
     parser.add_argument("--checkpoint", type=Path, help="segmentation checkpoint path")
+    parser.add_argument("--rock", help="rock folder name under data/ and datasets/")
+    parser.add_argument("--index-root", type=Path, help="path to multi-rock index root, defaults to datasets/")
     parser.add_argument("--shape", type=parse_zyx, default=DEFAULT_SHAPE, help="full volume shape z,y,x")
     parser.add_argument("--origin", type=parse_zyx, help="subcube start coordinate z,y,x")
-    parser.add_argument("--sample-index", type=int, default=-1, help="take origin from dataset_128/index_128.csv")
+    parser.add_argument("--sample-index", type=int, default=-1, help="take origin from datasets/<rock>/index_<cube_size>.csv")
     parser.add_argument("--cube-size", type=int, default=64)
     parser.add_argument("--mask-source", choices=("auto", "model", "target", "raw"), default="auto")
     parser.add_argument(

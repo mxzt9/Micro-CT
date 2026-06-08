@@ -28,6 +28,20 @@ def test_film_unet_forward_backward_and_alpha_rows():
     assert torch.isfinite(model.router.alpha_logits.grad).all()
 
 
+def test_film_unet_dict_output_and_non_multiple_shape():
+    model = FiLMRoutedUNet3D(in_channels=1, out_channels=1, base_channels=4, ctx_dim=16)
+    x = torch.randn(1, 1, 17, 19, 21)
+
+    out = model(x, return_dict=True)
+
+    assert out["logits"].shape == (1, 1, 17, 19, 21)
+    assert out["decoder_embedding"].shape[-3:] == (17, 19, 21)
+    assert out["rock_embedding"].shape == (1, 128)
+    assert out["router_alpha"].shape == (4, 4)
+    assert out["porosity_logit"].shape == (1,)
+    assert out["percolation_logits"].shape == (1, 3)
+
+
 def test_pnm_solver_matches_series_and_parallel_graphs():
     solver = DifferentiablePNMSolver(mu=1.0, eps=1e-12)
 
@@ -91,6 +105,8 @@ def test_pore_network_data_conversion_shapes_without_ph():
     assert data.log_g_hp.shape == (2,)
     assert data.metadata["node_feature_dim"] == data.node_attr.shape[1]
     assert data.metadata["edge_feature_dim"] == data.edge_attr.shape[1]
+    assert "topology" in data.metadata
+    assert data.metadata["topology"]["num_components"] == 1
 
 
 def test_gudhi_requirement_has_clear_error_when_missing():
