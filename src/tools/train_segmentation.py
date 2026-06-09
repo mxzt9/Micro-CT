@@ -20,7 +20,6 @@ from utils import (  # noqa: E402
     DEFAULT_CUBE_SIZES,
     BereaPatchDataset,
     CubeSizeBatchSampler,
-    FiLMRoutedUNet3D,
     TOPOLOGY_FEATURE_DIM,
     TopologyAdaptiveRoutedUNet3D,
     auxiliary_physics_loss,
@@ -76,8 +75,6 @@ def make_loader(
 
 
 def build_segmentation_model(name: str, *, base_channels: int, ctx_dim: int) -> torch.nn.Module:
-    if name == "film":
-        return FiLMRoutedUNet3D(base_channels=base_channels, ctx_dim=ctx_dim)
     if name == "adaptive":
         return AdaptiveRoutedUNet3D(base_channels=base_channels, ctx_dim=ctx_dim)
     if name == "topology":
@@ -176,9 +173,9 @@ def write_history_csv(path: Path, history: list[dict[str, float]]) -> None:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Train FiLMRoutedUNet3D segmentation outside Jupyter.")
+    parser = argparse.ArgumentParser(description="Train TopologyAdaptiveRoutedUNet3D segmentation outside Jupyter.")
     parser.add_argument("--root", type=Path, default=ROOT)
-    parser.add_argument("--model", choices=("film", "adaptive", "topology"), default="film")
+    parser.add_argument("--model", choices=("adaptive", "topology"), default="topology")
     parser.add_argument("--mode", choices=("quick", "full"), default="quick")
     parser.add_argument("--cube-sizes", nargs="+", type=int, default=list(DEFAULT_CUBE_SIZES))
     parser.add_argument("--size-weights", default="64:0.50,128:0.35,192:0.15")
@@ -217,7 +214,7 @@ def main() -> None:
     pin_memory = device.type == "cuda"
     loader_batch_size = parse_int_map(args.batch_size_by_cube_size) or args.batch_size
     if args.checkpoint is None:
-        filename = "film_routed_unet3d_best.pth" if args.model == "film" else f"{args.model}_routed_unet3d_best.pth"
+        filename = f"{args.model}_routed_unet3d_best.pth"
         args.checkpoint = ROOT / "models" / filename
     args.checkpoint.parent.mkdir(parents=True, exist_ok=True)
     return_topology = args.model == "topology"

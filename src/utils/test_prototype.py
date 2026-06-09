@@ -2,29 +2,33 @@ from __future__ import annotations
 
 import torch
 
-from utils import FiLMRoutedUNet3D, PoreNetworkPermeabilityModel
+from utils import TopologyAdaptiveRoutedUNet3D, PoreNetworkPermeabilityModel
 
 
 def main() -> None:
     torch.manual_seed(0)
 
     print("=" * 60)
-    print("1) FiLM-routed UNet3D")
+    print("1) Topology-adaptive routed UNet3D")
     print("=" * 60)
-    unet = FiLMRoutedUNet3D(in_channels=1, out_channels=1, base_channels=8, ctx_dim=32)
+    unet = TopologyAdaptiveRoutedUNet3D(in_channels=1, out_channels=1, base_channels=8, ctx_dim=32, ph_dim=6, topology_dim=6)
     x = torch.randn(2, 1, 64, 64, 64)
-    logits, emb = unet(x)
+    ph_features = torch.randn(2, 6)
+    out = unet(x, ph_features=ph_features, return_dict=True)
+    logits = out["logits"]
+    emb = out["decoder_embedding"]
     print("input        :", tuple(x.shape))
     print("mask logits  :", tuple(logits.shape))
     print("voxel embeds :", tuple(emb.shape))
 
-    alpha = unet.router.alpha()
-    print("alpha row sums:", alpha.sum(dim=1).detach())
+    alpha = out["router_alpha"]
+    print("alpha shape:", alpha.shape)
+    print("alpha row sums:", alpha.sum(dim=-1).detach())
 
     loss = logits.mean() + emb.pow(2).mean()
     loss.backward()
-    grad_alpha = unet.router.alpha_logits.grad
-    print("grad reached alpha_logits:", grad_alpha is not None and torch.isfinite(grad_alpha).all().item())
+    grad_ok = any(p.grad is not None and torch.isfinite(p.grad).all() for p in unet.router.parameters())
+    print("grad reached router:", grad_ok)
 
     print()
     print("=" * 60)

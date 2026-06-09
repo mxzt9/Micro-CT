@@ -8,39 +8,39 @@ import torch
 
 from utils.dependencies import require_gudhi
 from utils.adaptive_routing import AdaptiveRoutedUNet3D, TopologyAdaptiveRoutedUNet3D
-from utils.film_routing import FiLMRoutedUNet3D
 from utils.network import openpnm_to_pore_network_data
 from utils.pnm_gnn import DifferentiablePNMSolver, PoreNetworkPermeabilityModel, ThroatConductanceGNN
 
 
-def test_film_unet_forward_backward_and_alpha_rows():
-    model = FiLMRoutedUNet3D(in_channels=1, out_channels=1, base_channels=4, ctx_dim=16)
+def test_topology_unet_forward_backward_and_alpha_rows():
+    model = TopologyAdaptiveRoutedUNet3D(in_channels=1, out_channels=1, base_channels=4, ctx_dim=16, ph_dim=6, topology_dim=6)
     x = torch.randn(1, 1, 16, 16, 16)
+    ph_features = torch.randn(1, 6)
 
-    logits, embeddings = model(x)
+    out = model(x, ph_features=ph_features, return_dict=True)
+    logits = out["logits"]
+    embeddings = out["decoder_embedding"]
     loss = logits.mean() + embeddings.square().mean()
     loss.backward()
 
-    alpha = model.router.alpha()
+    alpha = out["router_alpha"]
     assert logits.shape == (1, 1, 16, 16, 16)
     assert embeddings.shape == (1, 4, 16, 16, 16)
-    assert torch.allclose(alpha.sum(dim=1), torch.ones(alpha.shape[0]))
-    assert model.router.alpha_logits.grad is not None
-    assert torch.isfinite(model.router.alpha_logits.grad).all()
+    assert torch.allclose(alpha.sum(dim=-1), torch.ones(alpha.shape[:2]), atol=1e-6)
+    assert any(p.grad is not None and torch.isfinite(p.grad).all() for p in model.router.parameters())
 
 
-def test_film_unet_dict_output_and_non_multiple_shape():
-    model = FiLMRoutedUNet3D(in_channels=1, out_channels=1, base_channels=4, ctx_dim=16)
+def test_topology_unet_dict_output_and_non_multiple_shape():
+    model = TopologyAdaptiveRoutedUNet3D(in_channels=1, out_channels=1, base_channels=4, ctx_dim=16, ph_dim=6, topology_dim=6)
     x = torch.randn(1, 1, 17, 19, 21)
+    ph_features = torch.randn(1, 6)
 
-    out = model(x, return_dict=True)
+    out = model(x, ph_features=ph_features, return_dict=True)
 
     assert out["logits"].shape == (1, 1, 17, 19, 21)
     assert out["decoder_embedding"].shape[-3:] == (17, 19, 21)
-    assert out["rock_embedding"].shape == (1, 128)
-    assert out["router_alpha"].shape == (4, 4)
-    assert out["porosity_logit"].shape == (1,)
-    assert out["percolation_logits"].shape == (1, 3)
+    assert out["router_alpha"].shape == (1, 4, model.router.num_sources)
+    assert out["topology_pred"].shape == (1, 6)
 
 
 def test_adaptive_unet_forward_backward_and_dynamic_alpha():
