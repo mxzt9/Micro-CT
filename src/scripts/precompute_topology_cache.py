@@ -1,35 +1,3 @@
-"""Fast topology / persistent homology cache precompute.
-
-This script computes the same .npy cache format that BereaPatchDataset already uses:
-
-    outputs/topology_cache/<rock>/cs128_z0_y128_x256_raw_m32.npy
-    outputs/topology_cache/<rock>/cs128_z0_y128_x256_target_m32.npy
-
-Why this is faster than the old script:
-- no DataLoader;
-- no Dataset.__getitem__;
-- no noise augmentation;
-- no torch batch creation;
-- direct index CSV reading;
-- direct memmap slicing;
-- optional multiprocessing.
-
-Run from project root:
-
-    python src/fast_precompute_topology_cache.py --source both --cube-sizes 64 128 192 --topology-max-size 32 --workers 8
-
-Examples:
-
-    # Only input PH features
-    python src/fast_precompute_topology_cache.py --source raw --cube-sizes 64 128 --topology-max-size 24 --workers 8
-
-    # Full current training cache: raw + target
-    python src/fast_precompute_topology_cache.py --source both --cube-sizes 64 128 192 --topology-max-size 32 --workers 8
-
-    # Safe single-process mode for debugging
-    python src/fast_precompute_topology_cache.py --source both --workers 1
-"""
-
 from __future__ import annotations
 
 import argparse

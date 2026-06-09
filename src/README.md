@@ -1,22 +1,53 @@
-# Digital Core Training Package
+# Micro-CT Digital Core Pipeline
 
-Portable package for staged Digital Core training:
+## Getting Started
 
-`raw/segmented cube -> FiLM UNet segmentation -> PoreSpy/OpenPNM network -> features + PH -> GNN log(g) -> differentiable PNM -> kx, ky, kz`
+The entire pipeline is in a single notebook:
 
-## Install
-
-```bash
-pip install -r src/requirements.txt
+```
+src/full_pipeline.ipynb
 ```
 
-`gudhi` is required. The environment notebook checks this explicitly.
+Copy it to Colab, install dependencies (`pip install -r src/requirements.txt`),
+and run the sections you need. Each section is self-contained.
 
-## Expected Data Layout
+## Structure
 
-Place or mount your data in the project root:
+```
+src/
+  full_pipeline.ipynb      ← единый ноутбук (весь пайплайн)
+  requirements.txt
+  README.md
 
-```text
+  utils/                   ← основные модули (не трогать — отовсюду импорты)
+    __init__.py
+    common.py              ← базовые 3D-слои (ConvGNAct3D, DoubleConv3D, UNet3D)
+    adaptive_routing.py    ← AdaptiveRoutedUNet3D, TopologyAdaptiveRoutedUNet3D
+    data.py                ← BereaPatchDataset, CubeSizeBatchSampler, write_patch_indices
+    losses.py              ← BCEDiceLoss, auxiliary_physics_loss, topology_prediction_loss
+    topology.py            ← PH-топология (cubical_persistence_summary, TOPOLOGY_FEATURE_DIM)
+    network.py             ← PoreSpy/OpenPNM экстракция, PoreNetworkData, PH-фичи
+    pipeline.py            ← DigitalCorePipeline (сегментация → экстракция → GNN)
+    pnm_gnn.py             ← PoreNetworkPermeabilityModel, DifferentiablePNMSolver
+    training.py            ← EarlyStopping, MetricTracker
+    dependencies.py        ← check_required_dependencies
+
+  scripts/                 ← CLI-скрипты
+    train.py                              ← обучение сегментации
+    compare_models.py                     ← сравнение архитектур
+    visualize.py                          ← 3D-визуализация
+    precompute_topology_cache.py          ← быстрый прекомпьют PH-кэша
+    check_graph_orientation.py            ← проверка ориентации графов
+
+  tests/                   ← pytest-тесты
+    test_digital_core_pipeline.py
+    test_data_multirock.py
+    test_network_extraction_smoke.py
+```
+
+## Data Layout
+
+```
 data/
   Berea/
     grayscale.raw
@@ -31,100 +62,69 @@ datasets/
     index_128.csv
     index_192.csv
   <other_rock>/
-    index_64.csv
-    index_128.csv
-    index_192.csv
+    ...
 models/
 outputs/
+  networks/
 ```
 
-Each index CSV must contain: `z,y,x,split`. `cube_size` and `rock` columns are optional and are filled by the dataset loader when absent.
+## Pipeline Sections (in order)
 
-The old single-rock layout is still supported:
+| Section | Description |
+|---------|-------------|
+| **0** Setup & Environment Check | Paths, torch, CUDA, gudhi |
+| **1** Prepare Data | Scan rocks, write index CSVs (one-time) |
+| **2** Train Segmentation Model | Train TopologyAdaptiveRoutedUNet3D |
+| **3** Extract Pore Networks | PoreSpy/OpenPNM → .pt files |
+| **4** Train GNN Permeability Model | GNN on extracted networks |
+| **5** Run Full Pipeline | Load both models, run one cube |
+| **6** Validate Segmentation | Dice/BCE/error rate by rock + size |
+| **7** Compare Variants (optional) | Topology vs Adaptive on 64³ |
 
-```text
-data/
-  Berea_2d25um_grayscale.raw
-  Berea_2d25um_grayscale_filtered.raw
-  Berea_2d25um_binary.raw
-dataset_128/
-  index_128.csv
-```
+## Colab Notes
 
-## Notebooks
+- Install: `!pip install -r src/requirements.txt`
+- Mount Drive if data is there: `from google.colab import drive; drive.mount('/content/drive')`
+- Run only needed sections (e.g. skip Section 1 if datasets/ ready)
 
-Run in this order:
+## Import Convention
 
-1. `src/notebooks/00_prepare_data.ipynb`  
-   Discovers rock folders and writes `index_64.csv`, `index_128.csv`, `index_192.csv`.
-
-2. `src/notebooks/00_environment_check.ipynb`  
-   Verifies imports, CUDA, `gudhi`, and a tiny model forward.
-
-3. `src/notebooks/01_train_segmentation.ipynb`  
-   Trains `FiLMRoutedUNet3D` on `raw -> binary pore mask` using cube sizes `64, 128, 192`.
-
-4. `src/notebooks/02_extract_networks_openpnm.ipynb`  
-   Uses PoreSpy/OpenPNM to convert segmented cubes into pore-network `.pt` files.
-
-5. `src/notebooks/03_train_gnn_pnm.ipynb`  
-   Trains `PoreNetworkPermeabilityModel` on extracted network tensors and target `k`.
-
-6. `src/notebooks/04_run_full_pipeline.ipynb`  
-   Runs the orchestrated pipeline on one cube and saves a summary CSV.
-
-## Fast Training Modes
-
-`src/notebooks/01_train_segmentation.ipynb` has `TRAIN_MODE`:
-
-- `quick`: real data with `SAMPLES_PER_GROUP`, `MAX_TRAIN_BATCHES`, and `MAX_VAL_BATCHES` caps. Use it for iteration before long runs.
-- `full`: full real-data epoch.
-
-For 11 rocks, prefer fixed-budget epochs first: cap samples per `rock + cube_size`, train `64/128` more often, and schedule `192` less frequently until the architecture and losses are stable.
-
-For faster real runs outside Jupyter:
-
-```bash
-python src/tools/train_segmentation.py --mode quick --num-workers 2
-```
-
-Adaptive/topology comparison on 64-cube patches:
-
-```bash
-python src/tools/compare_segmentation_variants.py --cube-size 64 --epochs 1 --samples-per-group 4 --max-train-batches 8 --max-val-batches 4 --base-channels 8 --ctx-dim 32
-```
-
-The same comparison can be run interactively from `src/notebooks/06_compare_segmentation_models.ipynb`.
-
-`00_prepare_data.ipynb` can write `porosity` and `percolates_z/y/x` into index CSVs (`COMPUTE_AUX_TARGETS = True`). Training then reuses those labels instead of recomputing connected components for every sampled cube.
-
-## Modules
-
-Import from `utils`, not from old research notebooks:
+Import from `utils`, not from individual modules:
 
 ```python
 from utils import (
     BereaPatchDataset,
-    MultiScaleNoiseConsistencyDataset,
-    MultiRockPatchDataset,
-    FiLMRoutedUNet3D,
     DigitalCorePipeline,
+    TopologyAdaptiveRoutedUNet3D,
     PoreNetworkPermeabilityModel,
+    check_required_dependencies,
 )
+```
+
+## Fast Training Modes
+
+Section 2 has `TRAIN_MODE`:
+
+- **quick**: real data with caps on samples/batches per epoch
+- **full**: full epoch over all data
+
+CLI equivalent:
+
+```bash
+python src/scripts/train.py --mode quick --num-workers 2 --model topology
+```
+
+Architecture comparison (Section 7 equivalent):
+
+```bash
+python src/scripts/compare_models.py --cube-size 64 --epochs 1 --samples-per-group 4
 ```
 
 ## Notes
 
-- The pipeline is orchestrated end-to-end, but PoreSpy/OpenPNM extraction is not differentiable.
-- Training is staged by design: segmentation first, network extraction second, GNN/PNM third.
-- `BereaPatchDataset(..., cube_size=[64, 128, 192], balance=True)` dynamically discovers rocks and balances train epochs by `rock + cube_size`.
-- `MultiScaleNoiseConsistencyDataset(..., view_cube_sizes=[64, 128, 192])` returns centered noisy views of the same patch for rock-embedding consistency training.
-- `FiLMRoutedUNet3D(...)(x, return_dict=True)` returns `logits`, `rock_embedding`, `decoder_embedding`, `router_alpha`, `porosity_logit`, and `percolation_logits`.
-- `AdaptiveRoutedUNet3D` adds residual GN/GELU blocks, attention skip gates, trilinear upsampling, per-sample router alpha `[B,L,K]`, and AdaGN modulation.
-- `TopologyAdaptiveRoutedUNet3D` additionally consumes raw-derived PH summaries `[B,6]` and predicts a topology summary target. PH input is computed from grayscale only; binary-derived topology is used only as an auxiliary loss target to avoid label leakage.
-- Use `sliding_window_inference_3d(model, x, window_size=128, overlap=0.5)` for large volumes at inference time.
-- `PoreNetworkData` stores tensors needed by GNN/PNM: `coords`, `edge_index`, `node_attr`, `edge_attr`, `log_g_hp`, `domain_size`, `metadata`.
-
-## Architecture Notes
-
-Dynamic routing fixes the old global `alpha_logits` limitation by producing one routing matrix per sample. Attention gates should reduce false pores from skip connections, and trilinear upsampling avoids ConvTranspose checkerboard risk. Topology is kept conservative in v1: PH features plus an auxiliary head, not a differentiable topo-loss, because topo-loss would add dependency and runtime risk before the short-run comparison is stable. AdaGN still has a shift term, so it can move activations, but the shift is applied after normalization and is more controlled than the old unnormalized FiLM beta.
+- PoreSpy/OpenPNM extraction is **not differentiable** — training is staged by design.
+- `BereaPatchDataset(..., cube_size=[64, 128, 192], balance=True)` balances by rock + cube_size.
+- `TopologyAdaptiveRoutedUNet3D` consumes PH features `[B, 6]` computed from grayscale only;
+  binary-derived topology is used only as an auxiliary loss target (no label leakage).
+- Use `sliding_window_inference_3d(model, x, window_size=128, overlap=0.5)` for large volumes at inference.
+- `PoreNetworkData` stores graph tensors: coords, edge_index, node_attr, edge_attr, log_g_hp.
