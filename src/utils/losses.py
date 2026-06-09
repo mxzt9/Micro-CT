@@ -86,3 +86,25 @@ def auxiliary_physics_loss(
         loss = loss + percolation_weight * percolation_loss
 
     return loss, parts
+
+
+def topology_prediction_loss(
+    outputs: dict[str, torch.Tensor],
+    topology_target: torch.Tensor | None,
+    *,
+    topology_weight: float = 0.01,
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    """Auxiliary loss for PH summary prediction.
+
+    The dataset stores raw PH summaries. Training compares them after log1p
+    compression so component counts do not dominate segmentation losses.
+    """
+
+    if topology_target is None or "topology_pred" not in outputs or topology_weight <= 0:
+        device_tensor = next(iter(outputs.values()))
+        return device_tensor.new_tensor(0.0), {}
+
+    target = torch.log1p(topology_target.float().clamp_min(0.0))
+    pred = outputs["topology_pred"]
+    loss = F.smooth_l1_loss(pred, target)
+    return topology_weight * loss, {"topology_loss": loss}

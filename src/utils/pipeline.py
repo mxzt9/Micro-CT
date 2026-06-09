@@ -7,7 +7,8 @@ import numpy as np
 import torch
 
 from .common import sliding_window_inference_3d
-from .film_routing import FiLMRoutedUNet3D
+from .adaptive_routing import TopologyAdaptiveRoutedUNet3D
+from .topology import TOPOLOGY_FEATURE_DIM
 from .network import (
     PoreNetworkData,
     calculate_openpnm_stokes_permeability,
@@ -77,12 +78,13 @@ class DigitalCorePipeline:
         sliding_window_size: int | tuple[int, int, int] | None = None,
         sliding_overlap: float = 0.5,
     ) -> "DigitalCorePipeline":
-        segmentation_model = FiLMRoutedUNet3D(
+        segmentation_model = TopologyAdaptiveRoutedUNet3D(
             in_channels=1,
             out_channels=1,
             base_channels=base_channels,
             ctx_dim=ctx_dim,
-            return_embeddings=True,
+            ph_dim=TOPOLOGY_FEATURE_DIM,
+            topology_dim=TOPOLOGY_FEATURE_DIM,
         )
         return cls(
             segmentation_model=segmentation_model,

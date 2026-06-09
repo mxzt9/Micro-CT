@@ -5,6 +5,7 @@ import pandas as pd
 import torch
 from torch.utils.data import DataLoader
 
+import utils.data as data_module
 from utils import (
     DEFAULT_CUBE_SIZES,
     BereaPatchDataset,
@@ -195,6 +196,52 @@ def test_dataset_uses_cached_aux_targets_from_index(tmp_path):
 
     assert float(sample["porosity"]) == 0.25
     assert sample["percolates"].tolist() == [1.0, 0.0, 1.0]
+
+
+def test_dataset_topology_features_are_optional_and_cached(tmp_path, monkeypatch):
+    shape = (8, 8, 8)
+    _write_raw_pair(tmp_path, "sandstone", shape)
+    index_dir = tmp_path / "datasets" / "sandstone"
+    index_dir.mkdir(parents=True, exist_ok=True)
+    pd.DataFrame(
+        [{"z": 0, "y": 0, "x": 0, "split": "train", "cube_size": 4, "rock": "sandstone"}]
+    ).to_csv(index_dir / "index_4.csv", index=False)
+
+    calls = []
+
+    def fake_summary(volume, *, max_size):
+        calls.append((tuple(volume.shape), max_size, bool(np.asarray(volume).dtype == np.bool_)))
+        base = float(np.asarray(volume, dtype=np.float32).mean())
+        return np.asarray([1.0, base, 0.5, 2.0, base + 1.0, 0.25], dtype=np.float32)
+
+    monkeypatch.setattr(data_module, "cubical_persistence_summary", fake_summary)
+
+    plain = BereaPatchDataset(tmp_path, split="train", cube_size=4, shape=shape, noise_types=["none"], balance=False)
+    plain_sample = plain[0]
+    assert "ph_features" not in plain_sample
+    assert "topology_target" not in plain_sample
+
+    dataset = BereaPatchDataset(
+        tmp_path,
+        split="train",
+        cube_size=4,
+        shape=shape,
+        noise_types=["none"],
+        balance=False,
+        return_topology=True,
+        topology_cache_dir=tmp_path / "topology_cache",
+        topology_max_size=4,
+    )
+
+    first = dataset[0]
+    second = dataset[0]
+
+    assert first["ph_features"].shape == (6,)
+    assert first["topology_target"].shape == (6,)
+    assert torch.equal(first["ph_features"], second["ph_features"])
+    assert torch.equal(first["topology_target"], second["topology_target"])
+    assert len(calls) == 2
+    assert len(list((tmp_path / "topology_cache").rglob("*.npy"))) == 2
 
 
 def test_size_sampling_weights_reduce_expensive_size(tmp_path):

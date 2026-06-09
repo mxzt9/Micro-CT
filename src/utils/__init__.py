@@ -8,6 +8,12 @@ from .common import (
     sliding_window_inference_3d,
     unpad_3d,
 )
+from .adaptive_routing import (
+    AttentionGate3D,
+    DynamicContextRouter,
+    ResBlock3D,
+    TopologyAdaptiveRoutedUNet3D,
+)
 from .data import (
     DEFAULT_CUBE_SIZES,
     BereaPatchDataset,
@@ -24,13 +30,13 @@ from .data import (
     write_patch_indices,
 )
 from .dependencies import check_required_dependencies, require_gudhi
-from .film_routing import ContextSources3D, FiLMRoutedUNet3D, FiLMRouter
 from .losses import (
     BCEDiceLoss,
     DiceLoss,
     auxiliary_physics_loss,
     dice_score_from_logits,
     embedding_consistency_loss,
+    topology_prediction_loss,
 )
 from .network import (
     PoreNetworkData,
@@ -42,23 +48,23 @@ from .network import (
 )
 from .pipeline import DigitalCorePipeline, PermeabilityResult, PipelineResult, SegmentationResult
 from .pnm_gnn import DifferentiablePNMSolver, PoreNetworkPermeabilityModel, ThroatConductanceGNN
+from .topology import TOPOLOGY_FEATURE_DIM, cubical_persistence_summary
 from .training import EarlyStopping, MetricTracker
 
 __all__ = [
     "BCEDiceLoss",
+    "AttentionGate3D",
     "BereaPatchDataset",
     "BereaSegmentationDataset",
     "DEFAULT_CUBE_SIZES",
-    "ContextSources3D",
     "ConvGNAct3D",
     "CubeSizeBatchSampler",
     "DiceLoss",
     "DifferentiablePNMSolver",
     "DigitalCorePipeline",
     "DoubleConv3D",
+    "DynamicContextRouter",
     "EarlyStopping",
-    "FiLMRoutedUNet3D",
-    "FiLMRouter",
     "MetricTracker",
     "MultiScaleNoiseConsistencyDataset",
     "MultiScalePatchDataset",
@@ -67,14 +73,18 @@ __all__ = [
     "PipelineResult",
     "PoreNetworkData",
     "PoreNetworkPermeabilityModel",
+    "ResBlock3D",
     "RockVolumeSpec",
     "SegmentationResult",
+    "TOPOLOGY_FEATURE_DIM",
     "ThroatConductanceGNN",
+    "TopologyAdaptiveRoutedUNet3D",
     "UNet3D",
     "auxiliary_physics_loss",
     "build_patch_index",
     "calculate_openpnm_stokes_permeability",
     "check_required_dependencies",
+    "cubical_persistence_summary",
     "dice_score_from_logits",
     "discover_rock_volumes",
     "embedding_consistency_loss",
@@ -89,6 +99,7 @@ __all__ = [
     "resolve_patch_index_path",
     "safe_concat",
     "sliding_window_inference_3d",
+    "topology_prediction_loss",
     "unpad_3d",
     "write_patch_indices",
 ]

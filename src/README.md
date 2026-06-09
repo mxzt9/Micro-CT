@@ -88,6 +88,14 @@ For faster real runs outside Jupyter:
 python src/tools/train_segmentation.py --mode quick --num-workers 2
 ```
 
+Adaptive/topology comparison on 64-cube patches:
+
+```bash
+python src/tools/compare_segmentation_variants.py --cube-size 64 --epochs 1 --samples-per-group 4 --max-train-batches 8 --max-val-batches 4 --base-channels 8 --ctx-dim 32
+```
+
+The same comparison can be run interactively from `src/notebooks/06_compare_segmentation_models.ipynb`.
+
 `00_prepare_data.ipynb` can write `porosity` and `percolates_z/y/x` into index CSVs (`COMPUTE_AUX_TARGETS = True`). Training then reuses those labels instead of recomputing connected components for every sampled cube.
 
 ## Modules
@@ -112,5 +120,11 @@ from utils import (
 - `BereaPatchDataset(..., cube_size=[64, 128, 192], balance=True)` dynamically discovers rocks and balances train epochs by `rock + cube_size`.
 - `MultiScaleNoiseConsistencyDataset(..., view_cube_sizes=[64, 128, 192])` returns centered noisy views of the same patch for rock-embedding consistency training.
 - `FiLMRoutedUNet3D(...)(x, return_dict=True)` returns `logits`, `rock_embedding`, `decoder_embedding`, `router_alpha`, `porosity_logit`, and `percolation_logits`.
+- `AdaptiveRoutedUNet3D` adds residual GN/GELU blocks, attention skip gates, trilinear upsampling, per-sample router alpha `[B,L,K]`, and AdaGN modulation.
+- `TopologyAdaptiveRoutedUNet3D` additionally consumes raw-derived PH summaries `[B,6]` and predicts a topology summary target. PH input is computed from grayscale only; binary-derived topology is used only as an auxiliary loss target to avoid label leakage.
 - Use `sliding_window_inference_3d(model, x, window_size=128, overlap=0.5)` for large volumes at inference time.
 - `PoreNetworkData` stores tensors needed by GNN/PNM: `coords`, `edge_index`, `node_attr`, `edge_attr`, `log_g_hp`, `domain_size`, `metadata`.
+
+## Architecture Notes
+
+Dynamic routing fixes the old global `alpha_logits` limitation by producing one routing matrix per sample. Attention gates should reduce false pores from skip connections, and trilinear upsampling avoids ConvTranspose checkerboard risk. Topology is kept conservative in v1: PH features plus an auxiliary head, not a differentiable topo-loss, because topo-loss would add dependency and runtime risk before the short-run comparison is stable. AdaGN still has a shift term, so it can move activations, but the shift is applied after normalization and is more controlled than the old unnormalized FiLM beta.

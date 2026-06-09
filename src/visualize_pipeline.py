@@ -15,7 +15,7 @@ import pygame
 import torch
 from scipy.ndimage import distance_transform_edt, generate_binary_structure, label
 
-from utils import FiLMRoutedUNet3D, discover_rock_volumes, extract_porespy_openpnm_network, resolve_patch_index_path
+from utils import TopologyAdaptiveRoutedUNet3D, TOPOLOGY_FEATURE_DIM, cubical_persistence_summary, discover_rock_volumes, extract_porespy_openpnm_network, resolve_patch_index_path
 
 try:
     import imgui
@@ -436,7 +436,11 @@ def build_segmentation_model(checkpoint_path: Path, device: torch.device, base_c
     checkpoint = torch.load(checkpoint_path, map_location=device)
     base_channels = int(checkpoint.get("base_channels", base_channels))
     ctx_dim = int(checkpoint.get("ctx_dim", ctx_dim))
-    model = FiLMRoutedUNet3D(base_channels=base_channels, ctx_dim=ctx_dim).to(device)
+    ph_dim = int(checkpoint.get("ph_dim", TOPOLOGY_FEATURE_DIM))
+    model = TopologyAdaptiveRoutedUNet3D(
+        base_channels=base_channels, ctx_dim=ctx_dim,
+        ph_dim=ph_dim, topology_dim=ph_dim,
+    ).to(device)
     model.load_state_dict(checkpoint["model_state_dict"])
     model.eval()
     return model
@@ -444,8 +448,11 @@ def build_segmentation_model(checkpoint_path: Path, device: torch.device, base_c
 
 def segment_cube(model: torch.nn.Module, raw_cube: np.ndarray, device: torch.device) -> np.ndarray:
     x = torch.from_numpy(raw_cube.astype(np.float32) / 255.0).unsqueeze(0).unsqueeze(0).to(device)
+    # Compute PH features from the raw cube (grayscale) for TopologyAdaptiveRoutedUNet3D
+    ph_features = cubical_persistence_summary(raw_cube, max_size=min(raw_cube.shape) // 2)
+    ph_tensor = torch.from_numpy(ph_features.astype(np.float32)).unsqueeze(0).to(device)
     with torch.no_grad():
-        output = model(x, return_dict=True)
+        output = model(x, ph_features=ph_tensor, return_dict=True)
         if isinstance(output, dict):
             logits = output["logits"]
         else:
@@ -558,7 +565,7 @@ def prepare_state(args: argparse.Namespace) -> tuple[PipelineState, dict[str, Pa
 
     raw_path = args.raw or (spec.gray_path if spec is not None else root / "data" / "Berea_2d25um_grayscale_filtered.raw")
     binary_path = args.binary or (spec.binary_path if spec is not None else root / "data" / "Berea_2d25um_binary.raw")
-    checkpoint_path = args.checkpoint or root / "models" / "film_routed_unet3d_best.pth"
+    checkpoint_path = args.checkpoint or root / "models" / "segmentation_best.pth"
     if not raw_path.exists():
         raise FileNotFoundError(
             f"raw volume was not found: {raw_path}. "

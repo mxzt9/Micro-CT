@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import os
 from pathlib import Path
 from typing import Any, Sequence
 import warnings
@@ -10,6 +11,8 @@ import pandas as pd
 import torch
 from scipy.ndimage import generate_binary_structure, label
 from torch.utils.data import Dataset, Sampler
+
+from .topology import cubical_persistence_summary
 
 
 DEFAULT_CUBE_SIZES = (64, 128, 192)
@@ -339,6 +342,9 @@ class BereaPatchDataset(Dataset):
         max_samples: int | None = None,
         return_aux_targets: bool = True,
         size_sampling_weights: dict[int, float] | None = None,
+        return_topology: bool = False,
+        topology_cache_dir: str | Path | None = None,
+        topology_max_size: int | None = 32,
     ):
         self.root_dir = Path(root_dir)
         self.split = split
@@ -352,6 +358,10 @@ class BereaPatchDataset(Dataset):
         self.return_aux_targets = return_aux_targets
         self.size_sampling_weights = {int(k): float(v) for k, v in (size_sampling_weights or {}).items()}
         self._aux_cache: dict[int, tuple[float, np.ndarray]] = {}
+        self.return_topology = bool(return_topology)
+        self.topology_cache_dir = Path(topology_cache_dir) if topology_cache_dir is not None else self.root_dir / "outputs" / "topology_cache"
+        self.topology_max_size = topology_max_size
+        self._topology_memory_cache: dict[tuple[str, str, int, int, int, int, int | None], np.ndarray] = {}
 
         self.specs = discover_rock_volumes(
             self.root_dir,
@@ -581,6 +591,48 @@ class BereaPatchDataset(Dataset):
         binary_cube = volume["binary"][z : z + cs, y : y + cs, x : x + cs]
         return {"gray": gray_cube, "binary": binary_cube, "coord": (z, y, x), "rock": rock, "cube_size": cs}
 
+    def _topology_cache_path(
+        self,
+        *,
+        rock: str,
+        source: str,
+        cube_size: int,
+        coord: tuple[int, int, int],
+    ) -> Path:
+        z, y, x = coord
+        max_label = "full" if self.topology_max_size is None else str(int(self.topology_max_size))
+        name = f"cs{cube_size}_z{z}_y{y}_x{x}_{source}_m{max_label}.npy"
+        return self.topology_cache_dir / rock / name
+
+    def _cached_topology_summary(
+        self,
+        volume: np.ndarray,
+        *,
+        rock: str,
+        source: str,
+        cube_size: int,
+        coord: tuple[int, int, int],
+    ) -> np.ndarray:
+        key = (rock, source, int(cube_size), int(coord[0]), int(coord[1]), int(coord[2]), self.topology_max_size)
+        if key in self._topology_memory_cache:
+            return self._topology_memory_cache[key]
+
+        path = self._topology_cache_path(rock=rock, source=source, cube_size=cube_size, coord=coord)
+        if path.exists():
+            value = np.load(path).astype(np.float32, copy=False)
+            self._topology_memory_cache[key] = value
+            return value
+
+        # Keep PH input honest: source="raw" is derived only from grayscale, while
+        # source="target" may use binary labels and must be used only as a loss target.
+        value = cubical_persistence_summary(volume, max_size=self.topology_max_size).astype(np.float32, copy=False)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path = path.with_name(f"{path.stem}.{os.getpid()}.{id(value)}.tmp.npy")
+        np.save(tmp_path, value)
+        tmp_path.replace(path)
+        self._topology_memory_cache[key] = value
+        return value
+
     def __getitem__(self, idx: int) -> dict[str, Any]:
         cube = self.get_cube(idx)
         clean_x = self.normalize_uint8(cube["gray"])
@@ -606,7 +658,7 @@ class BereaPatchDataset(Dataset):
             porosity = 0.0
             percolates = np.zeros(3, dtype=np.float32)
 
-        return {
+        sample = {
             "x": torch.from_numpy(noisy_x).unsqueeze(0),
             "y": torch.from_numpy(target).unsqueeze(0),
             "coord": torch.tensor(cube["coord"], dtype=torch.long),
@@ -616,6 +668,26 @@ class BereaPatchDataset(Dataset):
             "percolates": torch.tensor(percolates, dtype=torch.float32),
             "noise": str(noise_type),
         }
+
+        if self.return_topology:
+            ph_features = self._cached_topology_summary(
+                clean_x,
+                rock=str(cube["rock"]),
+                source="raw",
+                cube_size=int(cube["cube_size"]),
+                coord=tuple(int(v) for v in cube["coord"]),
+            )
+            topology_target = self._cached_topology_summary(
+                target > 0.5,
+                rock=str(cube["rock"]),
+                source="target",
+                cube_size=int(cube["cube_size"]),
+                coord=tuple(int(v) for v in cube["coord"]),
+            )
+            sample["ph_features"] = torch.tensor(ph_features, dtype=torch.float32)
+            sample["topology_target"] = torch.tensor(topology_target, dtype=torch.float32)
+
+        return sample
 
 
 class CubeSizeBatchSampler(Sampler[list[int]]):

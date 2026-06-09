@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import sys
 from pathlib import Path
 
@@ -14,13 +15,17 @@ if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
 from utils import (  # noqa: E402
+    AdaptiveRoutedUNet3D,
     BCEDiceLoss,
     DEFAULT_CUBE_SIZES,
     BereaPatchDataset,
     CubeSizeBatchSampler,
     FiLMRoutedUNet3D,
+    TOPOLOGY_FEATURE_DIM,
+    TopologyAdaptiveRoutedUNet3D,
     auxiliary_physics_loss,
     dice_score_from_logits,
+    topology_prediction_loss,
 )
 from utils.training import EarlyStopping, MetricTracker  # noqa: E402
 
@@ -70,6 +75,26 @@ def make_loader(
     return DataLoader(dataset, **kwargs)
 
 
+def build_segmentation_model(name: str, *, base_channels: int, ctx_dim: int) -> torch.nn.Module:
+    if name == "film":
+        return FiLMRoutedUNet3D(base_channels=base_channels, ctx_dim=ctx_dim)
+    if name == "adaptive":
+        return AdaptiveRoutedUNet3D(base_channels=base_channels, ctx_dim=ctx_dim)
+    if name == "topology":
+        return TopologyAdaptiveRoutedUNet3D(
+            base_channels=base_channels,
+            ctx_dim=ctx_dim,
+            ph_dim=TOPOLOGY_FEATURE_DIM,
+            topology_dim=TOPOLOGY_FEATURE_DIM,
+        )
+    raise ValueError(f"unknown model: {name}")
+
+
+def router_entropy(alpha: torch.Tensor) -> torch.Tensor:
+    probs = alpha.float().clamp_min(1.0e-8)
+    return -(probs * probs.log()).sum(dim=-1).mean()
+
+
 def run_epoch(model, loader, criterion, optimizer, scaler, device, args, train: bool) -> dict[str, float]:
     model.train(train)
     stats = MetricTracker()
@@ -84,12 +109,21 @@ def run_epoch(model, loader, criterion, optimizer, scaler, device, args, train: 
         y = batch["y"].to(device, non_blocking=True)
         porosity = batch["porosity"].to(device, non_blocking=True)
         percolates = batch["percolates"].to(device, non_blocking=True)
+        ph_features = batch.get("ph_features")
+        topology_target = batch.get("topology_target")
+        if ph_features is not None:
+            ph_features = ph_features.to(device, non_blocking=True)
+        if topology_target is not None:
+            topology_target = topology_target.to(device, non_blocking=True)
 
         if train:
             optimizer.zero_grad(set_to_none=True)
 
         with torch.set_grad_enabled(train), torch.amp.autocast(device_type=device.type, enabled=args.amp and device.type == "cuda"):
-            out = model(x, return_dict=True)
+            if ph_features is not None:
+                out = model(x, ph_features=ph_features, return_dict=True)
+            else:
+                out = model(x, return_dict=True)
             logits = out["logits"]
             seg_loss, bce_loss, dice_loss = criterion(logits, y)
             aux_loss, _ = auxiliary_physics_loss(
@@ -100,7 +134,12 @@ def run_epoch(model, loader, criterion, optimizer, scaler, device, args, train: 
                 porosity_weight=args.aux_weight,
                 percolation_weight=args.aux_weight,
             )
-            loss = seg_loss + aux_loss
+            topo_loss, topo_parts = topology_prediction_loss(
+                out,
+                topology_target,
+                topology_weight=args.topology_weight,
+            )
+            loss = seg_loss + aux_loss + topo_loss
 
         if train:
             scaler.scale(loss).backward()
@@ -113,17 +152,33 @@ def run_epoch(model, loader, criterion, optimizer, scaler, device, args, train: 
         stats.update("loss", float(loss.detach().cpu()), batch_size)
         stats.update("seg_loss", float(seg_loss.detach().cpu()), batch_size)
         stats.update("aux_loss", float(aux_loss.detach().cpu()), batch_size)
+        stats.update("topology_loss", float(topo_loss.detach().cpu()), batch_size)
         stats.update("bce", float(bce_loss.detach().cpu()), batch_size)
         stats.update("dice_loss", float(dice_loss.detach().cpu()), batch_size)
         stats.update("dice", float(dice.detach().cpu()), batch_size)
+        stats.update("router_entropy", float(router_entropy(out["router_alpha"]).detach().cpu()), batch_size)
+        if "topology_loss" in topo_parts:
+            stats.update("topology_loss_raw", float(topo_parts["topology_loss"].detach().cpu()), batch_size)
         iterator.set_postfix(stats.postfix("loss", "dice"))
 
     return stats.as_dict()
 
 
+def write_history_csv(path: Path, history: list[dict[str, float]]) -> None:
+    if not history:
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fieldnames = sorted({key for row in history for key in row.keys()})
+    with path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(history)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Train FiLMRoutedUNet3D segmentation outside Jupyter.")
     parser.add_argument("--root", type=Path, default=ROOT)
+    parser.add_argument("--model", choices=("film", "adaptive", "topology"), default="film")
     parser.add_argument("--mode", choices=("quick", "full"), default="quick")
     parser.add_argument("--cube-sizes", nargs="+", type=int, default=list(DEFAULT_CUBE_SIZES))
     parser.add_argument("--size-weights", default="64:0.50,128:0.35,192:0.15")
@@ -142,9 +197,13 @@ def main() -> None:
     parser.add_argument("--ctx-dim", type=int, default=64)
     parser.add_argument("--lr", type=float, default=1.0e-4)
     parser.add_argument("--aux-weight", type=float, default=0.05)
+    parser.add_argument("--topology-weight", type=float, default=0.01)
+    parser.add_argument("--topology-cache-dir", type=Path, default=ROOT / "outputs" / "topology_cache")
+    parser.add_argument("--topology-max-size", type=int, default=32)
     parser.add_argument("--patience", type=int, default=3)
     parser.add_argument("--min-delta", type=float, default=1.0e-4)
-    parser.add_argument("--checkpoint", type=Path, default=ROOT / "models" / "film_routed_unet3d_best.pth")
+    parser.add_argument("--checkpoint", type=Path, default=None)
+    parser.add_argument("--history-csv", type=Path, default=None)
     parser.add_argument("--no-amp", action="store_true")
     args = parser.parse_args()
 
@@ -157,7 +216,11 @@ def main() -> None:
     args.amp = not args.no_amp
     pin_memory = device.type == "cuda"
     loader_batch_size = parse_int_map(args.batch_size_by_cube_size) or args.batch_size
+    if args.checkpoint is None:
+        filename = "film_routed_unet3d_best.pth" if args.model == "film" else f"{args.model}_routed_unet3d_best.pth"
+        args.checkpoint = ROOT / "models" / filename
     args.checkpoint.parent.mkdir(parents=True, exist_ok=True)
+    return_topology = args.model == "topology"
 
     train_ds = BereaPatchDataset(
         args.root,
@@ -166,6 +229,9 @@ def main() -> None:
         balance=True,
         samples_per_group=args.samples_per_group,
         size_sampling_weights=parse_weights(args.size_weights),
+        return_topology=return_topology,
+        topology_cache_dir=args.topology_cache_dir,
+        topology_max_size=args.topology_max_size,
     )
     val_ds = BereaPatchDataset(
         args.root,
@@ -174,18 +240,24 @@ def main() -> None:
         noise_types=["none"],
         balance=False,
         samples_per_group=args.samples_per_group,
+        return_topology=return_topology,
+        topology_cache_dir=args.topology_cache_dir,
+        topology_max_size=args.topology_max_size,
     )
     train_loader = make_loader(train_ds, loader_batch_size, True, args.num_workers, pin_memory, seed=42)
     val_loader = make_loader(val_ds, loader_batch_size, False, args.num_workers, pin_memory, seed=43)
 
-    model = FiLMRoutedUNet3D(base_channels=args.base_channels, ctx_dim=args.ctx_dim).to(device)
+    model = build_segmentation_model(args.model, base_channels=args.base_channels, ctx_dim=args.ctx_dim).to(device)
     criterion = BCEDiceLoss()
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1.0e-4)
     scaler = torch.amp.GradScaler(device.type, enabled=args.amp and device.type == "cuda")
     early = EarlyStopping(patience=args.patience, min_delta=args.min_delta, mode="min")
     history = []
 
-    print(f"device={device} mode={args.mode} train={len(train_ds)} val={len(val_ds)} workers={args.num_workers}")
+    print(
+        f"device={device} model={args.model} mode={args.mode} train={len(train_ds)} "
+        f"val={len(val_ds)} workers={args.num_workers}"
+    )
     print("train groups:")
     print(train_ds.df.groupby(["rock", "cube_size", "split"]).size().rename("samples").reset_index())
 
@@ -208,6 +280,7 @@ def main() -> None:
                     "history": history,
                     "base_channels": args.base_channels,
                     "ctx_dim": args.ctx_dim,
+                    "model": args.model,
                 },
                 args.checkpoint,
             )
@@ -215,6 +288,10 @@ def main() -> None:
         elif early.should_stop:
             print(f"early stop at epoch={epoch}; best val_loss={early.best:.4f}")
             break
+
+    if args.history_csv is not None:
+        write_history_csv(args.history_csv, history)
+        print(f"history: {args.history_csv}")
 
 
 if __name__ == "__main__":

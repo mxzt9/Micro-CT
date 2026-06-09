@@ -7,6 +7,7 @@ import pytest
 import torch
 
 from utils.dependencies import require_gudhi
+from utils.adaptive_routing import AdaptiveRoutedUNet3D, TopologyAdaptiveRoutedUNet3D
 from utils.film_routing import FiLMRoutedUNet3D
 from utils.network import openpnm_to_pore_network_data
 from utils.pnm_gnn import DifferentiablePNMSolver, PoreNetworkPermeabilityModel, ThroatConductanceGNN
@@ -40,6 +41,38 @@ def test_film_unet_dict_output_and_non_multiple_shape():
     assert out["router_alpha"].shape == (4, 4)
     assert out["porosity_logit"].shape == (1,)
     assert out["percolation_logits"].shape == (1, 3)
+
+
+def test_adaptive_unet_forward_backward_and_dynamic_alpha():
+    model = AdaptiveRoutedUNet3D(in_channels=1, out_channels=1, base_channels=4, ctx_dim=16)
+    x = torch.randn(2, 1, 16, 16, 16)
+
+    out = model(x, return_dict=True)
+    loss = out["logits"].mean() + out["decoder_embedding"].square().mean()
+    loss.backward()
+
+    alpha = out["router_alpha"]
+    assert out["logits"].shape == (2, 1, 16, 16, 16)
+    assert out["decoder_embedding"].shape == (2, 4, 16, 16, 16)
+    assert alpha.shape == (2, 4, model.router.num_sources)
+    assert torch.allclose(alpha.sum(dim=-1), torch.ones(alpha.shape[:2]), atol=1.0e-6)
+    assert model.router.mlp[-1].weight.grad is not None
+    assert torch.isfinite(model.router.mlp[-1].weight.grad).all()
+
+
+def test_topology_adaptive_unet_dict_output_and_non_multiple_shape():
+    model = TopologyAdaptiveRoutedUNet3D(in_channels=1, out_channels=1, base_channels=4, ctx_dim=16)
+    x = torch.randn(1, 1, 17, 19, 21)
+    ph_features = torch.rand(1, 6)
+
+    out = model(x, ph_features=ph_features, return_dict=True)
+
+    assert out["logits"].shape == (1, 1, 17, 19, 21)
+    assert out["decoder_embedding"].shape[-3:] == (17, 19, 21)
+    assert out["router_alpha"].shape == (1, 4, model.router.num_sources)
+    assert out["topology_pred"].shape == (1, 6)
+    with pytest.raises(ValueError, match="requires ph_features"):
+        model(x, return_dict=True)
 
 
 def test_pnm_solver_matches_series_and_parallel_graphs():
