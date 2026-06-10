@@ -8,7 +8,7 @@ import torch
 
 from .common import sliding_window_inference_3d
 from .adaptive_routing import TopologyAdaptiveRoutedUNet3D
-from .topology import TOPOLOGY_FEATURE_DIM
+from .topology import TOPOLOGY_FEATURE_DIM, cubical_persistence_summary
 from .network import (
     PoreNetworkData,
     calculate_openpnm_stokes_permeability,
@@ -229,7 +229,16 @@ class DigitalCorePipeline:
                 aux_outputs=None,
             )
         else:
-            segmentation = self.segment_cube(cube)
+            # Compute PH features for TopologyAdaptiveRoutedUNet3D
+            raw_np = np.asarray(cube) if isinstance(cube, np.ndarray) else cube.detach().cpu().numpy()
+            if raw_np.ndim == 5:
+                raw_np = raw_np[0, 0]
+            elif raw_np.ndim == 4:
+                raw_np = raw_np[0]
+            ph_features = torch.from_numpy(
+                cubical_persistence_summary(raw_np, max_size=min(raw_np.shape) // 2).astype(np.float32)
+            ).unsqueeze(0).to(self.device)
+            segmentation = self.segment_cube(cube, ph_features=ph_features)
             pore_mask = segmentation.mask
 
         pn, network_data = self.extract_network(

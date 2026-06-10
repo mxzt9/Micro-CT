@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import platform
 import sys
 from pathlib import Path
 
@@ -49,6 +50,17 @@ def parse_int_map(value: str | None) -> dict[int, int] | None:
     return result
 
 
+def auto_num_workers() -> int:
+    """Auto-detect safe number of workers.
+    
+    Windows has multiprocessing issues with memmap + DataLoader, so default to 0.
+    Linux/Colab can use multiple workers safely.
+    """
+    if platform.system() == "Windows":
+        return 0
+    return min(4, (torch.get_num_threads() or 2))
+
+
 def make_loader(
     dataset,
     batch_size: int | dict[int, int],
@@ -92,12 +104,18 @@ def router_entropy(alpha: torch.Tensor) -> torch.Tensor:
     return -(probs * probs.log()).sum(dim=-1).mean()
 
 
-def run_epoch(model, loader, criterion, optimizer, scaler, device, args, train: bool) -> dict[str, float]:
+def run_epoch(model, loader, criterion, optimizer, scaler, scheduler, device, args, train: bool) -> dict[str, float]:
     model.train(train)
     stats = MetricTracker()
     limit = args.max_train_batches if train else args.max_val_batches
     desc = "train" if train else "val"
     iterator = tqdm(loader, desc=desc, leave=False)
+
+    # Валидация: без gradient accumulation
+    if not train:
+        args.grad_accum_steps = 1
+
+    optimizer.zero_grad(set_to_none=True)
 
     for batch_idx, batch in enumerate(iterator):
         if limit is not None and batch_idx >= limit:
@@ -112,9 +130,6 @@ def run_epoch(model, loader, criterion, optimizer, scaler, device, args, train: 
             ph_features = ph_features.to(device, non_blocking=True)
         if topology_target is not None:
             topology_target = topology_target.to(device, non_blocking=True)
-
-        if train:
-            optimizer.zero_grad(set_to_none=True)
 
         with torch.set_grad_enabled(train), torch.amp.autocast(device_type=device.type, enabled=args.amp and device.type == "cuda"):
             if ph_features is not None:
@@ -138,10 +153,18 @@ def run_epoch(model, loader, criterion, optimizer, scaler, device, args, train: 
             )
             loss = seg_loss + aux_loss + topo_loss
 
+            # Gradient accumulation: делим loss на число шагов накопления
+            if train and args.grad_accum_steps > 1:
+                loss = loss / args.grad_accum_steps
+
         if train:
             scaler.scale(loss).backward()
-            scaler.step(optimizer)
-            scaler.update()
+            if (batch_idx + 1) % args.grad_accum_steps == 0:
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=args.grad_clip)
+                scaler.step(optimizer)
+                scaler.update()
+                optimizer.zero_grad(set_to_none=True)
 
         batch_size = x.size(0)
         with torch.no_grad():
@@ -157,6 +180,10 @@ def run_epoch(model, loader, criterion, optimizer, scaler, device, args, train: 
         if "topology_loss" in topo_parts:
             stats.update("topology_loss_raw", float(topo_parts["topology_loss"].detach().cpu()), batch_size)
         iterator.set_postfix(stats.postfix("loss", "dice"))
+
+    # Scheduler step after train epoch
+    if train and scheduler is not None:
+        scheduler.step()
 
     return stats.as_dict()
 
@@ -176,9 +203,9 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Train TopologyAdaptiveRoutedUNet3D segmentation outside Jupyter.")
     parser.add_argument("--root", type=Path, default=ROOT)
     parser.add_argument("--model", choices=("adaptive", "topology"), default="topology")
-    parser.add_argument("--mode", choices=("quick", "full"), default="quick")
+    parser.add_argument("--mode", choices=("quick", "medium", "full"), default="quick")
     parser.add_argument("--cube-sizes", nargs="+", type=int, default=list(DEFAULT_CUBE_SIZES))
-    parser.add_argument("--size-weights", default="64:0.50,128:0.35,192:0.15")
+    parser.add_argument("--size-weights", default="64:0.15,128:0.35,192:0.50")
     parser.add_argument("--samples-per-group", type=int, default=8)
     parser.add_argument("--max-train-batches", type=int, default=64)
     parser.add_argument("--max-val-batches", type=int, default=16)
@@ -187,14 +214,21 @@ def main() -> None:
     parser.add_argument(
         "--batch-size-by-cube-size",
         default=None,
-        help="Optional mapping like 64:8,128:2,192:1. Keeps each batch at one cube size.",
+        help="Optional mapping like 64:4,128:2,192:1. Keeps each batch at one cube size.",
     )
-    parser.add_argument("--num-workers", type=int, default=2)
-    parser.add_argument("--base-channels", type=int, default=16)
+    parser.add_argument("--grad-accum-steps", type=int, default=4,
+                        help="Gradient accumulation steps for effective batch size.")
+    parser.add_argument("--grad-clip", type=float, default=1.0,
+                        help="Gradient clipping max norm. 0 to disable.")
+    parser.add_argument("--num-workers", type=int, default=-1,
+                        help="DataLoader workers. -1 = auto (0 on Windows, 4 on Linux).")
+    parser.add_argument("--base-channels", type=int, default=32)
     parser.add_argument("--ctx-dim", type=int, default=64)
     parser.add_argument("--lr", type=float, default=1.0e-4)
     parser.add_argument("--aux-weight", type=float, default=0.05)
     parser.add_argument("--topology-weight", type=float, default=0.01)
+    parser.add_argument("--scheduler", choices=("none", "cosine"), default="cosine",
+                        help="LR scheduler type.")
     parser.add_argument("--topology-cache-dir", type=Path, default=ROOT / "outputs" / "topology_cache")
     parser.add_argument("--topology-max-size", type=int, default=32)
     parser.add_argument("--patience", type=int, default=3)
@@ -204,15 +238,29 @@ def main() -> None:
     parser.add_argument("--no-amp", action="store_true")
     args = parser.parse_args()
 
+    # Mode presets
     if args.mode == "full":
         args.samples_per_group = None
         args.max_train_batches = None
         args.max_val_batches = None
+    elif args.mode == "medium":
+        # Больше данных, чем quick, но не всё — для 11 пород
+        if args.samples_per_group == 8:
+            args.samples_per_group = 50
+        if args.max_train_batches == 64:
+            args.max_train_batches = 250
+        if args.max_val_batches == 16:
+            args.max_val_batches = 50
+
+    # Auto num_workers
+    if args.num_workers < 0:
+        args.num_workers = auto_num_workers()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     args.amp = not args.no_amp
     pin_memory = device.type == "cuda"
     loader_batch_size = parse_int_map(args.batch_size_by_cube_size) or args.batch_size
+
     if args.checkpoint is None:
         filename = f"{args.model}_routed_unet3d_best.pth"
         args.checkpoint = ROOT / "models" / filename
@@ -248,19 +296,28 @@ def main() -> None:
     criterion = BCEDiceLoss()
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1.0e-4)
     scaler = torch.amp.GradScaler(device.type, enabled=args.amp and device.type == "cuda")
+
+    # LR Scheduler
+    if args.scheduler == "cosine":
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
+    else:
+        scheduler = None
+
     early = EarlyStopping(patience=args.patience, min_delta=args.min_delta, mode="min")
     history = []
 
     print(
         f"device={device} model={args.model} mode={args.mode} train={len(train_ds)} "
-        f"val={len(val_ds)} workers={args.num_workers}"
+        f"val={len(val_ds)} workers={args.num_workers} "
+        f"grad_accum={args.grad_accum_steps} grad_clip={args.grad_clip} "
+        f"scheduler={args.scheduler}"
     )
     print("train groups:")
     print(train_ds.df.groupby(["rock", "cube_size", "split"]).size().rename("samples").reset_index())
 
     for epoch in range(1, args.epochs + 1):
-        train_metrics = run_epoch(model, train_loader, criterion, optimizer, scaler, device, args, train=True)
-        val_metrics = run_epoch(model, val_loader, criterion, optimizer, scaler, device, args, train=False)
+        train_metrics = run_epoch(model, train_loader, criterion, optimizer, scaler, scheduler, device, args, train=True)
+        val_metrics = run_epoch(model, val_loader, criterion, optimizer, scaler, None, device, args, train=False)
         history.append({"epoch": epoch, **{f"train_{k}": v for k, v in train_metrics.items()}, **{f"val_{k}": v for k, v in val_metrics.items()}})
         print(
             f"epoch={epoch} train_loss={train_metrics['loss']:.4f} train_dice={train_metrics['dice']:.4f} "

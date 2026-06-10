@@ -9,6 +9,14 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+# Ensure src/ is on sys.path so `from utils import ...` works regardless of cwd
+_SCRIPT_DIR = Path(__file__).resolve().parent
+_PROJECT_ROOT = _SCRIPT_DIR.parents[0]  # src/
+_REPO_ROOT = _PROJECT_ROOT.parents[0]   # micro_ct/
+for _p in (str(_PROJECT_ROOT), str(_REPO_ROOT / "src")):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
+
 import moderngl
 import numpy as np
 import pygame

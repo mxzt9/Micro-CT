@@ -9,6 +9,7 @@ from .common import (
     unpad_3d,
 )
 from .adaptive_routing import (
+    AdaptiveRoutedUNet3D,
     AttentionGate3D,
     DynamicContextRouter,
     ResBlock3D,
@@ -52,6 +53,7 @@ from .topology import TOPOLOGY_FEATURE_DIM, cubical_persistence_summary
 from .training import EarlyStopping, MetricTracker
 
 __all__ = [
+    "AdaptiveRoutedUNet3D",
     "BCEDiceLoss",
     "AttentionGate3D",
     "BereaPatchDataset",

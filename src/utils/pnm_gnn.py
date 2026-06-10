@@ -4,6 +4,7 @@ from typing import Optional
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 
 def scatter_sum(src: torch.Tensor, index: torch.Tensor, dim_size: int) -> torch.Tensor:
@@ -72,12 +73,16 @@ class ThroatConductanceGNN(nn.Module):
 
 
 class DifferentiablePNMSolver(nn.Module):
-    """PNM-решатель баланса масс с граничными условиями Дирихле по давлению."""
+    """PNM-решатель баланса масс с граничными условиями Дирихле по давлению.
 
-    def __init__(self, mu: float = 1.0e-3, eps: float = 1e-12):
+    Использует float64 для сборки лапласиана и решения СЛАУ для численной стабильности.
+    """
+
+    def __init__(self, mu: float = 1.0e-3, eps: float = 1e-12, use_double: bool = True):
         super().__init__()
         self.mu = mu
         self.eps = eps
+        self.use_double = use_double
 
     @staticmethod
     def _build_laplacian(g: torch.Tensor, edge_index: torch.Tensor, n: int) -> torch.Tensor:
@@ -89,6 +94,22 @@ class DifferentiablePNMSolver(nn.Module):
         laplacian = laplacian.index_put((j, j), g, accumulate=True)
         return laplacian
 
+    @staticmethod
+    def _compute_flow_residual(
+        pressure: torch.Tensor,
+        g: torch.Tensor,
+        edge_index: torch.Tensor,
+        n: int,
+    ) -> torch.Tensor:
+        """Невязка баланса массы: для каждой поры |Σ(flow_e)|.
+
+        Возвращает скаляр — средний модуль невязки на пору.
+        """
+        i_e, j_e = edge_index[0], edge_index[1]
+        flow_e = g * (pressure[i_e] - pressure[j_e])  # [E]
+        residual = scatter_sum(flow_e, i_e, n) - scatter_sum(flow_e, j_e, n)
+        return residual.abs().mean()
+
     def solve_axis(
         self,
         g: torch.Tensor,
@@ -98,7 +119,8 @@ class DifferentiablePNMSolver(nn.Module):
         domain_length: float,
         cross_area: float,
         frac: float = 0.05,
-    ) -> torch.Tensor:
+        return_all: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         n = coords.size(0)
         ca = coords[:, axis]
         span = ca.max() - ca.min()
@@ -109,29 +131,52 @@ class DifferentiablePNMSolver(nn.Module):
         fixed = inlet | outlet
         free = ~fixed
         if inlet.sum() == 0 or outlet.sum() == 0:
-            return g.new_tensor(0.0)
+            zero = g.new_tensor(0.0)
+            if return_all:
+                return zero, zero, g.new_tensor(0.0)
+            return zero
 
         pressure = g.new_zeros(n)
         pressure[inlet] = 1.0
         pressure[outlet] = 0.0
 
         if free.sum() > 0:
-            laplacian = self._build_laplacian(g, edge_index, n)
-            idx_free = free.nonzero(as_tuple=True)[0]
-            idx_fixed = fixed.nonzero(as_tuple=True)[0]
-            l_ff = laplacian[idx_free][:, idx_free]
-            l_fb = laplacian[idx_free][:, idx_fixed]
-            rhs = -l_fb @ pressure[idx_fixed]
-            l_ff = l_ff + self.eps * torch.eye(l_ff.size(0), device=g.device, dtype=g.dtype)
-            pressure = pressure.clone()
-            pressure[idx_free] = torch.linalg.solve(l_ff, rhs)
+            orig_dtype = g.dtype
+            if self.use_double:
+                g_solve = g.double()
+                laplacian = self._build_laplacian(g_solve, edge_index, n)
+                idx_free = free.nonzero(as_tuple=True)[0]
+                idx_fixed = fixed.nonzero(as_tuple=True)[0]
+                l_ff = laplacian[idx_free][:, idx_free]
+                l_fb = laplacian[idx_free][:, idx_fixed]
+                rhs = -l_fb @ pressure.to(g_solve.dtype)[idx_fixed]
+                l_ff = l_ff + self.eps * torch.eye(l_ff.size(0), device=g.device, dtype=g_solve.dtype)
+                p_free = torch.linalg.solve(l_ff, rhs)
+                pressure = pressure.clone()
+                pressure[idx_free] = p_free.to(orig_dtype)
+            else:
+                laplacian = self._build_laplacian(g, edge_index, n)
+                idx_free = free.nonzero(as_tuple=True)[0]
+                idx_fixed = fixed.nonzero(as_tuple=True)[0]
+                l_ff = laplacian[idx_free][:, idx_free]
+                l_fb = laplacian[idx_free][:, idx_fixed]
+                rhs = -l_fb @ pressure[idx_fixed]
+                l_ff = l_ff + self.eps * torch.eye(l_ff.size(0), device=g.device, dtype=g.dtype)
+                pressure = pressure.clone()
+                pressure[idx_free] = torch.linalg.solve(l_ff, rhs)
 
         i_e, j_e = edge_index[0], edge_index[1]
         flow_e = g * (pressure[i_e] - pressure[j_e])
         inlet_f = inlet.to(dtype=g.dtype)
         flow_rate = (flow_e * inlet_f[i_e]).sum() - (flow_e * inlet_f[j_e]).sum()
         permeability = flow_rate * self.mu * domain_length / (cross_area + self.eps)
-        return permeability.abs()
+        perm = permeability.abs()
+
+        if return_all:
+            flow_residual = self._compute_flow_residual(pressure, g, edge_index, n)
+            return perm, pressure.detach(), flow_residual
+
+        return perm
 
     def forward(
         self,
@@ -139,22 +184,75 @@ class DifferentiablePNMSolver(nn.Module):
         edge_index: torch.Tensor,
         coords: torch.Tensor,
         domain_size,
-    ) -> torch.Tensor:
+        return_all: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         lz, ly, lx = domain_size
         kz = self.solve_axis(g, edge_index, coords, 0, lz, ly * lx)
         ky = self.solve_axis(g, edge_index, coords, 1, ly, lz * lx)
         kx = self.solve_axis(g, edge_index, coords, 2, lx, lz * ly)
-        return torch.stack([kx, ky, kz])
+        k = torch.stack([kx, ky, kz])
+
+        if return_all:
+            _, _, res_z = self.solve_axis(g, edge_index, coords, 0, lz, ly * lx, return_all=True)
+            _, _, res_y = self.solve_axis(g, edge_index, coords, 1, ly, lz * lx, return_all=True)
+            _, _, res_x = self.solve_axis(g, edge_index, coords, 2, lx, lz * ly, return_all=True)
+            flow_residual = (res_z + res_y + res_x) / 3.0
+            return k, flow_residual
+
+        return k
 
 
 class PoreNetworkPermeabilityModel(nn.Module):
+    """GNN + дифференцируемый PNM-решатель для предсказания проницаемости.
+
+    Особенности:
+    - GNN предсказывает поправку к Hagen-Poiseuille baseline
+    - Дифференцируемый решатель Стокса с float64 для стабильности
+    - Опциональный физический auxiliary loss (массовая невязка)
+    """
+
     def __init__(self, node_in: int, edge_in: int, hidden: int = 64, layers: int = 3, mu: float = 1.0e-3):
         super().__init__()
         self.gnn = ThroatConductanceGNN(node_in, edge_in, hidden, layers)
         self.solver = DifferentiablePNMSolver(mu=mu)
 
-    def forward(self, node_attr, edge_index, edge_attr, coords, domain_size, log_g_hp=None):
+    def forward(
+        self,
+        node_attr: torch.Tensor,
+        edge_index: torch.Tensor,
+        edge_attr: torch.Tensor,
+        coords: torch.Tensor,
+        domain_size,
+        log_g_hp: Optional[torch.Tensor] = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Forward pass: GNN → проводимости → PNM → проницаемость.
+
+        Returns:
+            k: [3] тензор (kx, ky, kz)
+            log_g: [E] тензор логарифмов проводимости
+        """
         log_g = self.gnn(node_attr, edge_index, edge_attr, log_g_hp)
         g = torch.exp(log_g)
         k = self.solver(g, edge_index, coords, domain_size)
         return k, log_g
+
+    def forward_with_physics_loss(
+        self,
+        node_attr: torch.Tensor,
+        edge_index: torch.Tensor,
+        edge_attr: torch.Tensor,
+        coords: torch.Tensor,
+        domain_size,
+        log_g_hp: Optional[torch.Tensor] = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Forward pass + физическая невязка (auxiliary loss).
+
+        Returns:
+            k: [3] тензор (kx, ky, kz)
+            log_g: [E] тензор логарифмов проводимости
+            flow_residual: скаляр — средняя массовая невязка на пору
+        """
+        log_g = self.gnn(node_attr, edge_index, edge_attr, log_g_hp)
+        g = torch.exp(log_g)
+        k, flow_residual = self.solver(g, edge_index, coords, domain_size, return_all=True)
+        return k, log_g, flow_residual

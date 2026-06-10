@@ -41,7 +41,7 @@ def main() -> None:
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
     rows: list[dict[str, str | float | int]] = []
-    train_script = ROOT / "src" / "tools" / "train_segmentation.py"
+    train_script = ROOT / "src" / "scripts" / "train.py"
 
     for model in args.models:
         checkpoint = ROOT / "models" / f"{model}_quick_{args.cube_size}.pth"

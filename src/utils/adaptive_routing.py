@@ -316,3 +316,7 @@ class TopologyAdaptiveRoutedUNet3D(_AdaptiveRoutedUNet3DBase):
         if ph_features is None:
             raise ValueError("TopologyAdaptiveRoutedUNet3D requires ph_features")
         return super().forward(x, ph_features=ph_features, return_dict=return_dict)
+
+
+# Backward-compatible alias
+AdaptiveRoutedUNet3D = _AdaptiveRoutedUNet3DBase
