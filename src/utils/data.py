@@ -231,90 +231,71 @@ def build_patch_index(
 
     rows = [{"z": z, "y": y, "x": x, "split": split} for z in starts[0] for y in starts[1] for x in starts[2]]
     df = pd.DataFrame(rows)
+
+    # ПРОСТРАНСТВЕННЫЙ train/val split (вместо случайного).
+    #
+    # Раньше val-патчи выбирались случайно внутри того же объёма. Это давало
+    # утечку: (а) соседние патчи сильно коррелированы; (б) кубы разных
+    # размеров перекрываются — val-куб 64³ мог целиком лежать внутри
+    # train-куба 192³; (в) «last start» патчи перекрываются с соседними.
+    # Из-за этого val dice был завышен.
+    #
+    # Теперь val — это непрерывный слой объёма в конце оси z, единый для
+    # ВСЕХ cube_size (граница не зависит от cube_size). Патч относится к val,
+    # если он ЦЕЛИКОМ лежит в val-зоне; патчи, пересекающие границу,
+    # отбрасываются (буферная зона, исключающая частичное перекрытие).
     if val_fraction > 0 and len(df) > 0:
-        rng = np.random.default_rng(seed)
-        val_count = int(round(len(df) * val_fraction))
-        if val_count > 0:
-            val_idx = rng.choice(df.index.to_numpy(), size=val_count, replace=False)
-            df.loc[val_idx, "split"] = "val"
+        depth = int(shape[0])
+        val_boundary = int(round(depth * (1.0 - val_fraction)))
+        is_val = df["z"] >= val_boundary
+        crosses = (~is_val) & (df["z"] + cube_size > val_boundary)
+        df.loc[is_val, "split"] = "val"
+        df = df.loc[~crosses].reset_index(drop=True)
     df["cube_size"] = cube_size
     if rock is not None:
         df["rock"] = rock
     return df
 
 
-def percolation_labels_fast(mask: np.ndarray) -> np.ndarray:
-    """Быстрая проверка перколяции через BFS с ранним выходом.
-    
-    Вместо полной маркировки всех компонент связности (scipy.ndimage.label)
-    запускаем BFS только от граней. Если нашёлся путь — сразу возвращаем True.
-    
-    На 192³ кубе это в ~50 раз быстрее ndimage.label.
+def percolation_labels(mask: np.ndarray) -> np.ndarray:
+    """Return [percolates_z, percolates_y, percolates_x] for a binary pore mask.
+
+    Реализация через scipy.ndimage.label (C-код): одна маркировка компонент
+    на все три оси, затем проверка пересечения множеств меток на
+    противоположных гранях.
+
+    Прежний «быстрый BFS с ранним выходом» на чистом Python в худшем случае
+    (нет перколяции — а это частый случай для 64³) обходил всю компоненту
+    по вокселю за итерацию и был на порядки медленнее ndimage.label,
+    вопреки заявленному в докстринге «~50x быстрее».
     """
     mask = np.asarray(mask, dtype=bool)
-    if not mask.any():
-        return np.zeros(3, dtype=np.float32)
-
     result = np.zeros(3, dtype=np.float32)
-    directions = np.array([
-        [1, 0, 0], [-1, 0, 0],
-        [0, 1, 0], [0, -1, 0],
-        [0, 0, 1], [0, 0, -1],
-    ], dtype=np.int32)
-    shape = np.array(mask.shape, dtype=np.int32)
+    if not mask.any():
+        return result
+
+    structure = generate_binary_structure(3, 1)  # 6-связность
+    labels, num = label(mask, structure=structure)
+    if num == 0:
+        return result
 
     for axis in range(3):
-        # Пробуем найти путь вдоль axis
-        visited = np.zeros(mask.shape, dtype=bool)
-
-        # Собираем seed-точки на низкой грани
         slices_low = [slice(None)] * 3
+        slices_high = [slice(None)] * 3
         slices_low[axis] = 0
-        seed_coords = np.argwhere(mask[tuple(slices_low)] & ~visited[tuple(slices_low)])
-        if len(seed_coords) == 0:
-            continue
-
-        seed_coords = np.concatenate([
-            seed_coords[:, :axis],
-            np.zeros((len(seed_coords), 1), dtype=np.int32),
-            seed_coords[:, axis:],
-        ], axis=1)
-
-        # BFS от низкой грани
-        from collections import deque
-        queue = deque()
-        for s in seed_coords:
-            pos = tuple(int(v) for v in s)
-            visited[pos] = True
-            queue.append(pos)
-
-        found = False
-        while queue and not found:
-            pos = queue.popleft()
-            # Проверяем, дошли ли до высокой грани
-            if pos[axis] == shape[axis] - 1:
-                found = True
-                break
-            for d in directions:
-                nz = pos[0] + d[0]
-                ny = pos[1] + d[1]
-                nx = pos[2] + d[2]
-                if 0 <= nz < shape[0] and 0 <= ny < shape[1] and 0 <= nx < shape[2]:
-                    if mask[nz, ny, nx] and not visited[nz, ny, nx]:
-                        visited[nz, ny, nx] = True
-                        queue.append((nz, ny, nx))
-
-        result[axis] = float(found)
+        slices_high[axis] = -1
+        low_labels = np.unique(labels[tuple(slices_low)])
+        high_labels = np.unique(labels[tuple(slices_high)])
+        low_labels = low_labels[low_labels > 0]
+        high_labels = high_labels[high_labels > 0]
+        if low_labels.size and high_labels.size and np.intersect1d(low_labels, high_labels, assume_unique=True).size:
+            result[axis] = 1.0
 
     return result
 
 
-def percolation_labels(mask: np.ndarray) -> np.ndarray:
-    """Return [percolates_z, percolates_y, percolates_x] for a binary pore mask.
-    
-    Использует быстрый BFS с ранним выходом.
-    """
-    return percolation_labels_fast(mask)
+# Обратная совместимость со старым именем
+percolation_labels_fast = percolation_labels
 
 
 def add_aux_targets_to_index(
@@ -324,56 +305,80 @@ def add_aux_targets_to_index(
     *,
     pore_value: int = 0,
     num_workers: int = 0,
+    chunk_memory_mb: int = 256,
 ) -> pd.DataFrame:
     """Add porosity and percolation labels to an index dataframe once, during preparation.
+
+    Кубы обрабатываются ПОТОКОВО, чанками с ограничением по памяти: в RAM
+    одновременно живёт не больше ~chunk_memory_mb мегабайт кубов (плюс их
+    копии в очередях воркеров на время чанка). Прежняя реализация сначала
+    материализовала ВСЕ кубы списком и разом отправляла их в futures —
+    на полном объёме это съедало десятки ГБ и роняло процесс по OOM.
 
     Args:
         df: index dataframe
         binary_volume: memmap или ndarray
         cube_size: размер куба
         pore_value: значение пор в binary (0 по умолчанию)
-        num_workers: число процессов для параллельной обработки (0 = последовательно)
+        num_workers: число процессов для параллельной перколяции (0 = последовательно)
+        chunk_memory_mb: бюджет RAM на один чанк кубов, МБ
     """
     df = df.copy()
-    porosity_values: list[float] = []
-    percolation_values: list[np.ndarray] = []
+    n = len(df)
+    porosity_values = np.zeros(n, dtype=np.float32)
+    percolation_values = np.zeros((n, 3), dtype=np.float32)
+    if n == 0:
+        df["porosity"] = porosity_values
+        df["percolates_z"] = percolation_values[:, 0]
+        df["percolates_y"] = percolation_values[:, 1]
+        df["percolates_x"] = percolation_values[:, 2]
+        return df
 
-    # Собираем все кубы в список
-    cubes: list[np.ndarray] = []
-    for row in tqdm(list(df.itertuples(index=False)), desc=f"  reading {cube_size}³ cubes", leave=False):
-        z, y, x = int(getattr(row, "z")), int(getattr(row, "y")), int(getattr(row, "x"))
+    coords = [
+        (int(getattr(row, "z")), int(getattr(row, "y")), int(getattr(row, "x")))
+        for row in df.itertuples(index=False)
+    ]
+    bytes_per_cube = int(cube_size) ** 3  # bool = 1 байт/воксель
+    chunk_size = max(1, int(chunk_memory_mb * 1024 * 1024 // bytes_per_cube))
+
+    def _read_cube(i: int) -> np.ndarray:
+        z, y, x = coords[i]
         cube = binary_volume[z : z + cube_size, y : y + cube_size, x : x + cube_size]
-        target = np.asarray(cube == pore_value, dtype=bool)
-        cubes.append(target)
+        return np.asarray(cube == pore_value, dtype=bool)
 
-    # Порозитость — быстро, в 1 поток
-    porosity_values = [float(c.mean()) for c in cubes]
+    executor = None
+    if num_workers > 0 and n > 1:
+        from concurrent.futures import ProcessPoolExecutor
 
-    # Перколяция — bottleneck
-    if num_workers > 0 and len(cubes) > 1:
-        # Параллельная обработка
-        from functools import partial
-        from concurrent.futures import ProcessPoolExecutor, as_completed
+        executor = ProcessPoolExecutor(max_workers=num_workers)
 
-        with ProcessPoolExecutor(max_workers=num_workers) as executor:
-            futures = {executor.submit(percolation_labels_fast, c): i for i, c in enumerate(cubes)}
-            percolation_values = [None] * len(cubes)
-            pbar = tqdm(total=len(cubes), desc=f"  percolation {cube_size}³ ({num_workers} workers)", leave=False)
-            for future in as_completed(futures):
-                idx = futures[future]
-                percolation_values[idx] = future.result()
-                pbar.update(1)
-            pbar.close()
-    else:
-        percolation_values = [
-            percolation_labels(c) for c in tqdm(cubes, desc=f"  percolation {cube_size}³", leave=False)
-        ]
+    desc = f"  aux targets {cube_size}\u00b3" + (f" ({num_workers} workers)" if executor else "")
+    pbar = tqdm(total=n, desc=desc, leave=False)
+    try:
+        for start in range(0, n, chunk_size):
+            idxs = list(range(start, min(start + chunk_size, n)))
+            cubes = [_read_cube(i) for i in idxs]
+            for i, cube in zip(idxs, cubes):
+                porosity_values[i] = float(cube.mean())
+            if executor is not None:
+                map_chunksize = max(1, len(cubes) // (num_workers * 4))
+                for i, result in zip(idxs, executor.map(percolation_labels, cubes, chunksize=map_chunksize)):
+                    percolation_values[i] = result
+                    pbar.update(1)
+            else:
+                for i, cube in zip(idxs, cubes):
+                    percolation_values[i] = percolation_labels(cube)
+                    pbar.update(1)
+            del cubes  # освобождаем чанк до чтения следующего
+    finally:
+        if executor is not None:
+            executor.shutdown()
+        pbar.close()
 
-    percolation = np.stack(percolation_values) if percolation_values else np.zeros((0, 3), dtype=np.float32)
     df["porosity"] = porosity_values
-    df["percolates_z"] = percolation[:, 0] if len(percolation) else []
-    df["percolates_y"] = percolation[:, 1] if len(percolation) else []
-    df["percolates_x"] = percolation[:, 2] if len(percolation) else []
+    df["percolates_z"] = percolation_values[:, 0]
+    df["percolates_y"] = percolation_values[:, 1]
+    df["percolates_x"] = percolation_values[:, 2]
     return df
 
 
@@ -471,6 +476,7 @@ def write_patch_indices(
                 df = add_aux_targets_to_index(df, binary, int(size), pore_value=pore_value, num_workers=num_workers)
             df.to_csv(path, index=False)
             records.append(df.assign(path=str(path)))
+        del binary  # закрыть memmap сразу, не держать страницы/хэндл до конца функции
     return pd.concat(records, ignore_index=True) if records else pd.DataFrame()
 
 
@@ -824,11 +830,18 @@ class BereaPatchDataset(Dataset):
         }
 
         if self.return_topology:
-            # PH рассчитывается из noisy_x (вход модели), чтобы train/inference
-            # были согласованы. На инференсе модель получает PH из реального
-            # (зашумлённого) входа, а не из чистого.
+            # PH рассчитывается из ЧИСТОГО grayscale (clean_x).
+            #
+            # Раньше PH считался из noisy_x с комментарием про «согласованность
+            # train/inference», но это не работало: (а) ключ кэша не включал
+            # тип/реализацию шума, поэтому с первой эпохи замораживалось PH
+            # одной случайной реализации и переиспользовалось для любых входов;
+            # (б) precompute_topology_cache.py считает raw-PH от чистого
+            # grayscale — предзаполненный кэш всё равно подменял noisy-PH на
+            # clean-PH. Детерминированный clean-PH делает кэш корректным и
+            # согласован со скриптом precompute и c инференсом.
             ph_features = self._cached_topology_summary(
-                noisy_x,
+                clean_x,
                 rock=str(cube["rock"]),
                 source="raw",
                 cube_size=int(cube["cube_size"]),

@@ -37,40 +37,37 @@ def target_k_from_metadata(network: Any) -> torch.Tensor:
     return torch.tensor([k["kx"], k["ky"], k["kz"]], dtype=torch.float32)
 
 
-def compute_k_median(networks: list[Any]) -> float:
-    """Вычисляет медиану k по всем тренировочным сетям для нормализации."""
-    k_all = []
-    for net in networks:
-        k = net.metadata.get("openpnm_k", {})
-        if k:
-            k_all.extend([k["kx"], k["ky"], k["kz"]])
-    if not k_all:
-        return 1.0
-    k_t = torch.tensor(k_all)
-    return float(k_t.median().clamp_min(1e-30))
-
-
 def compute_network_loss(
     model: PoreNetworkPermeabilityModel,
     network: Any,
     device: torch.device,
-    k_median: float = 1.0,
     physics_weight: float = 0.0,
 ) -> dict[str, torch.Tensor]:
     """Вычисляет loss для одной сети.
+
+    Примечания:
+    - Нормализация на медиану k удалена: loss считается в log-пространстве,
+      где деление на константу — это вычитание одинаковой константы из pred
+      и target, которое сокращается в smooth_l1. Старый код её и так нигде
+      не использовал (мёртвый параметр).
+    - Неперколирующие оси (k=0) маскируются: иначе clamp(1e-30) даёт
+      log(k) = -69, и такая цель доминирует над loss всех остальных осей.
 
     Args:
         model: GNN+PNM модель
         network: PoreNetworkData
         device: устройство
-        k_median: медиана k для нормализации
         physics_weight: вес физического auxiliary loss (0 = выключен)
 
     Returns:
-        dict с ключами: loss, pred_k_log, target_k_log, physics_residual
+        dict с ключами: loss, k_loss, pred_k_log, target_k_log,
+        physics_residual, phys_loss, valid_axes
     """
     network = network.to(device)
-    target_k = target_k_from_metadata(network).to(device).clamp_min(1e-30)
+    target_k_raw = target_k_from_metadata(network).to(device)
+    # Маска перколирующих осей: k <= 0 означает отсутствие связного пути
+    valid_axes = target_k_raw > 0
+    target_k = target_k_raw.clamp_min(1e-30)
     target_k_log = torch.log(target_k)
 
     if physics_weight > 0:
@@ -96,10 +93,13 @@ def compute_network_loss(
     pred_k = pred_k.clamp_min(1e-30)
     pred_k_log = torch.log(pred_k)
 
-    # Нормализованный loss в log-space
-    k_loss = F.smooth_l1_loss(pred_k_log, target_k_log)
+    # Loss в log-space только по перколирующим осям
+    if valid_axes.any():
+        k_loss = F.smooth_l1_loss(pred_k_log[valid_axes], target_k_log[valid_axes])
+    else:
+        k_loss = pred_k_log.sum() * 0.0
 
-    # Физический auxiliary loss
+    # Физический auxiliary loss (невязка только по внутренним узлам решателя)
     phys_loss = physics_weight * flow_residual
 
     total_loss = k_loss + phys_loss
@@ -111,6 +111,7 @@ def compute_network_loss(
         "target_k_log": target_k_log.detach(),
         "physics_residual": flow_residual.detach(),
         "phys_loss": phys_loss.detach(),
+        "valid_axes": valid_axes.detach(),
     }
 
 
@@ -119,7 +120,6 @@ def evaluate(
     model: PoreNetworkPermeabilityModel,
     networks: list[Any],
     device: torch.device,
-    k_median: float = 1.0,
     physics_weight: float = 0.0,
 ) -> dict[str, float]:
     """Оценка на валидационной выборке."""
@@ -128,7 +128,7 @@ def evaluate(
     model.eval()
     stats = MetricTracker()
     for network in networks:
-        result = compute_network_loss(model, network, device, k_median, physics_weight)
+        result = compute_network_loss(model, network, device, physics_weight=physics_weight)
         stats.update("loss", float(result["loss"].cpu()), 1)
         stats.update("k_loss", float(result["k_loss"].cpu()), 1)
         stats.update("physics_residual", float(result["physics_residual"].cpu()), 1)
@@ -173,12 +173,17 @@ def main() -> None:
     parser.add_argument("--grad-clip", type=float, default=1.0,
                         help="Gradient clipping max norm. 0 to disable.")
 
-    # Нормализация и физический loss
-    parser.add_argument("--normalize-k", action="store_true", default=True,
-                        help="Normalize target k by median k (recommended)")
-    parser.add_argument("--no-normalize-k", action="store_false", dest="normalize_k")
-    parser.add_argument("--physics-weight", type=float, default=0.01,
-                        help="Weight for physics auxiliary loss (mass conservation). 0 to disable.")
+    # Физический loss
+    # Default 0: после точного решения СЛАУ невязка во внутренних узлах ~0,
+    # так что этот лосс почти не информативен; включать только осознанно
+    # (например, при переходе на итеративный/неточный решатель).
+    parser.add_argument("--physics-weight", type=float, default=0.0,
+                        help="Weight for physics auxiliary loss (interior mass conservation). 0 to disable.")
+
+    # Мини-батчи: шаг оптимизатора каждые N сетей (раньше был 1 шаг на эпоху —
+    # full-batch GD, всего ~200 шагов за всё обучение)
+    parser.add_argument("--batch-size", type=int, default=4,
+                        help="Networks per optimizer step.")
 
     # Split
     parser.add_argument("--val-fraction", type=float, default=0.2,
@@ -228,14 +233,6 @@ def main() -> None:
     edge_in = first.edge_attr.shape[1]
     print(f"node_in={node_in}, edge_in={edge_in}")
 
-    # Нормализация k
-    if args.normalize_k and train_networks:
-        k_median = compute_k_median(train_networks)
-        print(f"k_median (norm factor): {k_median:.3e}")
-    else:
-        k_median = 1.0
-        print("k normalization disabled")
-
     # Модель и оптимизатор
     model = PoreNetworkPermeabilityModel(
         node_in=node_in,
@@ -251,7 +248,7 @@ def main() -> None:
         weight_decay=args.weight_decay,
     )
 
-    # CosineAnnealing scheduler
+    # CosineAnnealing scheduler (шаг — по эпохам)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
 
     early = EarlyStopping(patience=args.patience, min_delta=args.min_delta, mode="min")
@@ -260,44 +257,51 @@ def main() -> None:
     print(f"model parameters: {params_count:,}")
     print(f"train networks: {len(train_networks)}, val networks: {len(val_networks)}")
     print(f"epochs: {args.epochs}, lr: {args.lr}, patience: {args.patience}")
-    print(f"normalize_k: {args.normalize_k}, physics_weight: {args.physics_weight}")
+    print(f"physics_weight: {args.physics_weight}, batch_size: {args.batch_size}")
     print(f"grad_clip: {args.grad_clip}")
     print()
 
     history = []
+    batch_size = max(1, int(args.batch_size))
 
     for epoch in range(1, args.epochs + 1):
         model.train()
         train_stats = MetricTracker()
 
-        # Gradient accumulation: накапливаем градиенты по ВСЕМ train сетям
-        optimizer.zero_grad(set_to_none=True)
-
         generator = torch.Generator().manual_seed(args.seed + epoch)
         train_order = torch.randperm(len(train_networks), generator=generator).tolist()
+
+        optimizer.zero_grad(set_to_none=True)
+        in_batch = 0
+
+        def optimizer_step() -> None:
+            if args.grad_clip > 0:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=args.grad_clip)
+            optimizer.step()
+            optimizer.zero_grad(set_to_none=True)
 
         for idx in tqdm(train_order, desc=f"epoch {epoch:3d}", leave=False):
             network = train_networks[idx]
 
             result = compute_network_loss(
                 model, network, device,
-                k_median=k_median,
                 physics_weight=args.physics_weight,
             )
-            loss = result["loss"]
+            # Усредняем по мини-батчу
+            (result["loss"] / batch_size).backward()
+            in_batch += 1
+            if in_batch == batch_size:
+                optimizer_step()
+                in_batch = 0
 
-            # Нормализуем loss: делим на число сетей (градиент-аккумуляция)
-            loss = loss / len(train_order)
-            loss.backward()
-
-            train_stats.update("loss", float(result["k_loss"].cpu()), 1)
+            train_stats.update("loss", float(result["loss"].detach().cpu()), 1)
+            train_stats.update("k_loss", float(result["k_loss"].cpu()), 1)
             train_stats.update("physics_residual", float(result["physics_residual"].cpu()), 1)
             train_stats.update("phys_loss", float(result["phys_loss"].cpu()), 1)
 
-        # Gradient clipping и шаг оптимизатора
-        if args.grad_clip > 0:
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=args.grad_clip)
-        optimizer.step()
+        # Хвост неполного мини-батча
+        if in_batch > 0:
+            optimizer_step()
         scheduler.step()
 
         train_metrics = train_stats.as_dict()
@@ -305,11 +309,12 @@ def main() -> None:
         # Валидация
         val_metrics = evaluate(
             model, val_networks, device,
-            k_median=k_median,
             physics_weight=args.physics_weight,
         )
 
-        monitor_loss = val_metrics.get("loss", train_metrics["loss"])
+        # Единая метрика для early stopping: k_loss (на val, иначе на train).
+        # Раньше сравнивались разные величины (val total loss vs train k_loss).
+        monitor_loss = val_metrics.get("k_loss", train_metrics["k_loss"])
 
         history.append({
             "epoch": epoch,
@@ -344,7 +349,6 @@ def main() -> None:
                     "monitor_loss": monitor_loss,
                     "train_loss": train_metrics["loss"],
                     "val_loss": val_metrics.get("loss"),
-                    "k_median": k_median,
                     "history": history,
                 },
                 args.checkpoint,

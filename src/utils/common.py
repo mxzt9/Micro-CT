@@ -114,9 +114,19 @@ def sliding_window_inference_3d(
     overlap: float = 0.5,
     *,
     ph_features: torch.Tensor | None = None,
+    ph_fn=None,
     output_key: str = "logits",
 ) -> torch.Tensor:
-    """Run tiled inference for large [B,C,D,H,W] volumes and blend logits."""
+    """Run tiled inference for large [B,C,D,H,W] volumes and blend logits.
+
+    Args:
+        ph_features: глобальные PH-фичи для всего объёма. ВНИМАНИЕ: при
+            обучении PH считается per-patch, поэтому для согласованности
+            лучше передать ph_fn.
+        ph_fn: callable(patch[B,C,d,h,w]) -> Tensor[B, ph_dim] — функция,
+            вычисляющая PH-фичи для каждого окна отдельно (как в обучении).
+            Если задана, имеет приоритет над ph_features.
+    """
 
     if x.ndim != 5:
         raise ValueError("sliding_window_inference_3d expects a [B,C,D,H,W] tensor")
@@ -147,7 +157,18 @@ def sliding_window_inference_3d(
         for y in starts(h, wh, strides[1]):
             for x0 in starts(w, ww, strides[2]):
                 patch = x[..., z : z + wd, y : y + wh, x0 : x0 + ww]
-                pred = model(patch, ph_features=ph_features)
+                if ph_fn is not None:
+                    patch_ph = ph_fn(patch)
+                elif ph_features is not None:
+                    patch_ph = ph_features
+                else:
+                    patch_ph = None
+                # Не передаём ph_features моделям, чей forward его не принимает
+                # (например, обычный UNet3D) — раньше это падало с TypeError.
+                if patch_ph is not None:
+                    pred = model(patch, ph_features=patch_ph)
+                else:
+                    pred = model(patch)
                 if isinstance(pred, dict):
                     pred = pred[output_key]
                 elif isinstance(pred, tuple):

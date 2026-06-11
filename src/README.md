@@ -1,15 +1,22 @@
-# Micro-CT Digital Core Pipeline
+# Micro-CT Segmentation Pipeline
+
+Цель проекта — **качественная сегментация порового пространства** на micro-CT
+разных пород и размеров кубов + честная оценка топологии маски.
+
+Контур проницаемости (PoreSpy/OpenPNM/GNN/PNM-решатель) из проекта удалён:
+без независимого ground truth (LBM/эксперимент) обучать предсказание k
+некорректно — таргет был циркулярным (считался из тех же HP-проводимостей).
 
 ## Getting Started
 
-The entire pipeline is in a single notebook:
+Весь пайплайн — в одном ноутбуке:
 
 ```
 src/full_pipeline.ipynb
 ```
 
-Copy it to Colab, install dependencies (`pip install -r src/requirements.txt`),
-and run the sections you need. Each section is self-contained.
+Скопируй в Colab, поставь зависимости (`pip install -r src/requirements.txt`)
+и выполняй секции по порядку.
 
 ## Structure
 
@@ -24,25 +31,22 @@ src/
     common.py              ← базовые 3D-слои (ConvGNAct3D, DoubleConv3D, UNet3D)
     adaptive_routing.py    ← AdaptiveRoutedUNet3D, TopologyAdaptiveRoutedUNet3D
     data.py                ← BereaPatchDataset, CubeSizeBatchSampler, write_patch_indices
-    losses.py              ← BCEDiceLoss, auxiliary_physics_loss, topology_prediction_loss
+    losses.py              ← BCEDiceLoss, SoftClDiceLoss (связность скелета), aux/topo лоссы
+    seg_metrics.py         ← clDice, числа Бетти, связная пористость, перколяция
     topology.py            ← PH-топология (cubical_persistence_summary, TOPOLOGY_FEATURE_DIM)
-    network.py             ← PoreSpy/OpenPNM экстракция, PoreNetworkData, PH-фичи
-    pipeline.py            ← DigitalCorePipeline (сегментация → экстракция → GNN)
-    pnm_gnn.py             ← PoreNetworkPermeabilityModel, DifferentiablePNMSolver
+    network.py             ← извлечение сети (PoreSpy/OpenPNM) — только для visualize.py
     training.py            ← EarlyStopping, MetricTracker
     dependencies.py        ← check_required_dependencies
 
   scripts/                 ← CLI-скрипты
-    train.py                              ← обучение сегментации
+    train.py                              ← обучение сегментации (есть --cldice-weight)
     compare_models.py                     ← сравнение архитектур
     visualize.py                          ← 3D-визуализация
     precompute_topology_cache.py          ← быстрый прекомпьют PH-кэша
-    check_graph_orientation.py            ← проверка ориентации графов
 
   tests/                   ← pytest-тесты
-    test_digital_core_pipeline.py
     test_data_multirock.py
-    test_network_extraction_smoke.py
+    test_segmentation_quality.py          ← clDice, Betti, перколяция
 ```
 
 ## Data Layout
@@ -65,7 +69,6 @@ datasets/
     ...
 models/
 outputs/
-  networks/
 ```
 
 ## Pipeline Sections (in order)
@@ -74,57 +77,26 @@ outputs/
 |---------|-------------|
 | **0** Setup & Environment Check | Paths, torch, CUDA, gudhi |
 | **1** Prepare Data | Scan rocks, write index CSVs (one-time) |
-| **2** Train Segmentation Model | Train TopologyAdaptiveRoutedUNet3D |
-| **3** Extract Pore Networks | PoreSpy/OpenPNM → .pt files |
-| **4** Train GNN Permeability Model | GNN on extracted networks |
-| **5** Run Full Pipeline | Load both models, run one cube |
-| **6** Validate Segmentation | Dice/BCE/error rate by rock + size |
-| **7** Compare Variants (optional) | Topology vs Adaptive on 64³ |
+| **2** Train Segmentation Model | BCE+Dice + **clDice** + aux + topo-head |
+| **3** Кривые обучения | loss/Dice/clDice по эпохам из history |
+| **4** Validate Segmentation | Dice + clDice + Betti + связная пористость + перколяция, графики, срезы |
 
-## Colab Notes
+## Лосс и метрики
 
-- Install: `!pip install -r src/requirements.txt`
-- Mount Drive if data is there: `from google.colab import drive; drive.mount('/content/drive')`
-- Run only needed sections (e.g. skip Section 1 if datasets/ ready)
+| Член лосса | Что ловит | Вес по умолчанию |
+|---|---|---|
+| BCE + Dice | повоксельная точность | 1.0 |
+| SoftClDiceLoss | разрывы / ложные перемычки скелета | 0.3 (`CLDICE_WEIGHT`) |
+| auxiliary_physics_loss | пористость, перколяция | 0.05 |
+| topology_prediction_loss | PH-саммари (регуляризация фич) | 0.01 |
 
-## Import Convention
+Валидация считает не только Dice: воксельный Dice почти не чувствует разрыв
+горла в 3 вокселя, а связная пористость и числа Бетти от этого меняются в разы.
+Смотри scatter «Dice vs clDice» — точки сильно ниже диагонали значат
+«воксели хорошие, топология разрушена».
 
-Import from `utils`, not from individual modules:
+## Tests
 
-```python
-from utils import (
-    BereaPatchDataset,
-    DigitalCorePipeline,
-    TopologyAdaptiveRoutedUNet3D,
-    PoreNetworkPermeabilityModel,
-    check_required_dependencies,
-)
 ```
-
-## Fast Training Modes
-
-Section 2 has `TRAIN_MODE`:
-
-- **quick**: real data with caps on samples/batches per epoch
-- **full**: full epoch over all data
-
-CLI equivalent:
-
-```bash
-python src/scripts/train.py --mode quick --num-workers 2 --model topology
+python -m pytest src/tests -q
 ```
-
-Architecture comparison (Section 7 equivalent):
-
-```bash
-python src/scripts/compare_models.py --cube-size 64 --epochs 1 --samples-per-group 4
-```
-
-## Notes
-
-- PoreSpy/OpenPNM extraction is **not differentiable** — training is staged by design.
-- `BereaPatchDataset(..., cube_size=[64, 128, 192], balance=True)` balances by rock + cube_size.
-- `TopologyAdaptiveRoutedUNet3D` consumes PH features `[B, 6]` computed from grayscale only;
-  binary-derived topology is used only as an auxiliary loss target (no label leakage).
-- Use `sliding_window_inference_3d(model, x, window_size=128, overlap=0.5)` for large volumes at inference.
-- `PoreNetworkData` stores graph tensors: coords, edge_index, node_attr, edge_attr, log_g_hp.

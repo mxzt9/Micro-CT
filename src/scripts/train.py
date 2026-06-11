@@ -21,6 +21,7 @@ from utils import (  # noqa: E402
     DEFAULT_CUBE_SIZES,
     BereaPatchDataset,
     CubeSizeBatchSampler,
+    SoftClDiceLoss,
     TOPOLOGY_FEATURE_DIM,
     TopologyAdaptiveRoutedUNet3D,
     auxiliary_physics_loss,
@@ -104,18 +105,21 @@ def router_entropy(alpha: torch.Tensor) -> torch.Tensor:
     return -(probs * probs.log()).sum(dim=-1).mean()
 
 
-def run_epoch(model, loader, criterion, optimizer, scaler, scheduler, device, args, train: bool) -> dict[str, float]:
+def run_epoch(model, loader, criterion, cldice_criterion, optimizer, scaler, scheduler, device, args, train: bool) -> dict[str, float]:
     model.train(train)
     stats = MetricTracker()
     limit = args.max_train_batches if train else args.max_val_batches
     desc = "train" if train else "val"
     iterator = tqdm(loader, desc=desc, leave=False)
 
-    # Валидация: без gradient accumulation
-    if not train:
-        args.grad_accum_steps = 1
+    # Валидация: без gradient accumulation.
+    # ВАЖНО: локальная переменная, а не мутация args — раньше здесь было
+    # `args.grad_accum_steps = 1`, что после первой же валидации навсегда
+    # отключало накопление градиентов для всех последующих train-эпох.
+    accum_steps = args.grad_accum_steps if train else 1
 
     optimizer.zero_grad(set_to_none=True)
+    steps_since_update = 0
 
     for batch_idx, batch in enumerate(iterator):
         if limit is not None and batch_idx >= limit:
@@ -151,20 +155,25 @@ def run_epoch(model, loader, criterion, optimizer, scaler, scheduler, device, ar
                 topology_target,
                 topology_weight=args.topology_weight,
             )
-            loss = seg_loss + aux_loss + topo_loss
-
-            # Gradient accumulation: делим loss на число шагов накопления
-            if train and args.grad_accum_steps > 1:
-                loss = loss / args.grad_accum_steps
+            if cldice_criterion is not None and args.cldice_weight > 0:
+                cldice_loss = cldice_criterion(logits, y)
+            else:
+                cldice_loss = logits.new_tensor(0.0)
+            loss = seg_loss + args.cldice_weight * cldice_loss + aux_loss + topo_loss
 
         if train:
-            scaler.scale(loss).backward()
-            if (batch_idx + 1) % args.grad_accum_steps == 0:
+            # Gradient accumulation: для backward делим на число шагов,
+            # но в метрики логируем ПОЛНЫЙ loss (иначе train/val несравнимы).
+            backward_loss = loss / accum_steps if accum_steps > 1 else loss
+            scaler.scale(backward_loss).backward()
+            steps_since_update += 1
+            if steps_since_update == accum_steps:
                 scaler.unscale_(optimizer)
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=args.grad_clip)
                 scaler.step(optimizer)
                 scaler.update()
                 optimizer.zero_grad(set_to_none=True)
+                steps_since_update = 0
 
         batch_size = x.size(0)
         with torch.no_grad():
@@ -173,6 +182,7 @@ def run_epoch(model, loader, criterion, optimizer, scaler, scheduler, device, ar
         stats.update("seg_loss", float(seg_loss.detach().cpu()), batch_size)
         stats.update("aux_loss", float(aux_loss.detach().cpu()), batch_size)
         stats.update("topology_loss", float(topo_loss.detach().cpu()), batch_size)
+        stats.update("cldice_loss", float(cldice_loss.detach().cpu()), batch_size)
         stats.update("bce", float(bce_loss.detach().cpu()), batch_size)
         stats.update("dice_loss", float(dice_loss.detach().cpu()), batch_size)
         stats.update("dice", float(dice.detach().cpu()), batch_size)
@@ -180,6 +190,15 @@ def run_epoch(model, loader, criterion, optimizer, scaler, scheduler, device, ar
         if "topology_loss" in topo_parts:
             stats.update("topology_loss_raw", float(topo_parts["topology_loss"].detach().cpu()), batch_size)
         iterator.set_postfix(stats.postfix("loss", "dice"))
+
+    # Хвост накопленных градиентов (когда число батчей не кратно accum_steps)
+    # раньше молча выбрасывался — досчитываем последний шаг.
+    if train and steps_since_update > 0:
+        scaler.unscale_(optimizer)
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=args.grad_clip)
+        scaler.step(optimizer)
+        scaler.update()
+        optimizer.zero_grad(set_to_none=True)
 
     # Scheduler step after train epoch
     if train and scheduler is not None:
@@ -227,6 +246,10 @@ def main() -> None:
     parser.add_argument("--lr", type=float, default=1.0e-4)
     parser.add_argument("--aux-weight", type=float, default=0.05)
     parser.add_argument("--topology-weight", type=float, default=0.01)
+    parser.add_argument("--cldice-weight", type=float, default=0.3,
+                        help="Вес clDice-лосса (связность скелета). 0 — отключить.")
+    parser.add_argument("--cldice-iters", type=int, default=10,
+                        help="Итерации мягкой скелетизации; >= макс. радиуса пор в вокселях.")
     parser.add_argument("--scheduler", choices=("none", "cosine"), default="cosine",
                         help="LR scheduler type.")
     parser.add_argument("--topology-cache-dir", type=Path, default=ROOT / "outputs" / "topology_cache")
@@ -294,6 +317,7 @@ def main() -> None:
 
     model = build_segmentation_model(args.model, base_channels=args.base_channels, ctx_dim=args.ctx_dim).to(device)
     criterion = BCEDiceLoss()
+    cldice_criterion = SoftClDiceLoss(num_iters=args.cldice_iters) if args.cldice_weight > 0 else None
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1.0e-4)
     scaler = torch.amp.GradScaler(device.type, enabled=args.amp and device.type == "cuda")
 
@@ -316,8 +340,8 @@ def main() -> None:
     print(train_ds.df.groupby(["rock", "cube_size", "split"]).size().rename("samples").reset_index())
 
     for epoch in range(1, args.epochs + 1):
-        train_metrics = run_epoch(model, train_loader, criterion, optimizer, scaler, scheduler, device, args, train=True)
-        val_metrics = run_epoch(model, val_loader, criterion, optimizer, scaler, None, device, args, train=False)
+        train_metrics = run_epoch(model, train_loader, criterion, cldice_criterion, optimizer, scaler, scheduler, device, args, train=True)
+        val_metrics = run_epoch(model, val_loader, criterion, cldice_criterion, optimizer, scaler, None, device, args, train=False)
         history.append({"epoch": epoch, **{f"train_{k}": v for k, v in train_metrics.items()}, **{f"val_{k}": v for k, v in val_metrics.items()}})
         print(
             f"epoch={epoch} train_loss={train_metrics['loss']:.4f} train_dice={train_metrics['dice']:.4f} "

@@ -100,14 +100,27 @@ class DifferentiablePNMSolver(nn.Module):
         g: torch.Tensor,
         edge_index: torch.Tensor,
         n: int,
+        interior_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Невязка баланса массы: для каждой поры |Σ(flow_e)|.
 
-        Возвращает скаляр — средний модуль невязки на пору.
+        ВАЖНО: невязка осмысленна только для внутренних (free) узлов.
+        На граничных (inlet/outlet) узлах она по определению равна
+        втекающему/вытекающему потоку и НЕ является нарушением физики —
+        включать её в loss нельзя (это штрафовало бы сам поток).
+
+        Args:
+            interior_mask: булева маска внутренних узлов; если None — все узлы.
+
+        Возвращает скаляр — средний модуль невязки на внутреннюю пору.
         """
         i_e, j_e = edge_index[0], edge_index[1]
         flow_e = g * (pressure[i_e] - pressure[j_e])  # [E]
         residual = scatter_sum(flow_e, i_e, n) - scatter_sum(flow_e, j_e, n)
+        if interior_mask is not None:
+            if interior_mask.sum() == 0:
+                return g.new_tensor(0.0)
+            residual = residual[interior_mask]
         return residual.abs().mean()
 
     def solve_axis(
@@ -150,7 +163,13 @@ class DifferentiablePNMSolver(nn.Module):
                 l_ff = laplacian[idx_free][:, idx_free]
                 l_fb = laplacian[idx_free][:, idx_fixed]
                 rhs = -l_fb @ pressure.to(g_solve.dtype)[idx_fixed]
-                l_ff = l_ff + self.eps * torch.eye(l_ff.size(0), device=g.device, dtype=g_solve.dtype)
+                # ВАЖНО: регуляризация ОТНОСИТЕЛЬНАЯ (масштабируется на средний
+                # диагональный элемент). Абсолютный eps=1e-12 для реальных СИ
+                # проводимостей (g ~ 1e-17) был на ~5 порядков БОЛЬШЕ самих
+                # элементов матрицы и полностью искажал решение (k завышалась
+                # в разы). Для g ~ 1 (юнит-тесты) разницы нет.
+                diag_scale = l_ff.diagonal().abs().mean().clamp_min(torch.finfo(g_solve.dtype).tiny)
+                l_ff = l_ff + (self.eps * diag_scale) * torch.eye(l_ff.size(0), device=g.device, dtype=g_solve.dtype)
                 p_free = torch.linalg.solve(l_ff, rhs)
                 pressure = pressure.clone()
                 pressure[idx_free] = p_free.to(orig_dtype)
@@ -161,7 +180,8 @@ class DifferentiablePNMSolver(nn.Module):
                 l_ff = laplacian[idx_free][:, idx_free]
                 l_fb = laplacian[idx_free][:, idx_fixed]
                 rhs = -l_fb @ pressure[idx_fixed]
-                l_ff = l_ff + self.eps * torch.eye(l_ff.size(0), device=g.device, dtype=g.dtype)
+                diag_scale = l_ff.diagonal().abs().mean().clamp_min(torch.finfo(g.dtype).tiny)
+                l_ff = l_ff + (self.eps * diag_scale) * torch.eye(l_ff.size(0), device=g.device, dtype=g.dtype)
                 pressure = pressure.clone()
                 pressure[idx_free] = torch.linalg.solve(l_ff, rhs)
 
@@ -173,7 +193,7 @@ class DifferentiablePNMSolver(nn.Module):
         perm = permeability.abs()
 
         if return_all:
-            flow_residual = self._compute_flow_residual(pressure, g, edge_index, n)
+            flow_residual = self._compute_flow_residual(pressure, g, edge_index, n, interior_mask=free)
             return perm, pressure.detach(), flow_residual
 
         return perm
@@ -187,19 +207,19 @@ class DifferentiablePNMSolver(nn.Module):
         return_all: bool = False,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         lz, ly, lx = domain_size
-        kz = self.solve_axis(g, edge_index, coords, 0, lz, ly * lx)
-        ky = self.solve_axis(g, edge_index, coords, 1, ly, lz * lx)
-        kx = self.solve_axis(g, edge_index, coords, 2, lx, lz * ly)
-        k = torch.stack([kx, ky, kz])
 
         if return_all:
-            _, _, res_z = self.solve_axis(g, edge_index, coords, 0, lz, ly * lx, return_all=True)
-            _, _, res_y = self.solve_axis(g, edge_index, coords, 1, ly, lz * lx, return_all=True)
-            _, _, res_x = self.solve_axis(g, edge_index, coords, 2, lx, lz * ly, return_all=True)
+            kz, _, res_z = self.solve_axis(g, edge_index, coords, 0, lz, ly * lx, return_all=True)
+            ky, _, res_y = self.solve_axis(g, edge_index, coords, 1, ly, lz * lx, return_all=True)
+            kx, _, res_x = self.solve_axis(g, edge_index, coords, 2, lx, lz * ly, return_all=True)
+            k = torch.stack([kx, ky, kz])
             flow_residual = (res_z + res_y + res_x) / 3.0
             return k, flow_residual
 
-        return k
+        kz = self.solve_axis(g, edge_index, coords, 0, lz, ly * lx)
+        ky = self.solve_axis(g, edge_index, coords, 1, ly, lz * lx)
+        kx = self.solve_axis(g, edge_index, coords, 2, lx, lz * ly)
+        return torch.stack([kx, ky, kz])
 
 
 class PoreNetworkPermeabilityModel(nn.Module):

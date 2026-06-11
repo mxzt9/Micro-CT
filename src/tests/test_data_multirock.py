@@ -303,3 +303,68 @@ def test_cube_size_batch_sampler_keeps_batch_shapes_stackable(tmp_path):
     assert [tuple(batch["x"].shape[-3:]) for batch in batches] == [(4, 4, 4), (6, 6, 6), (6, 6, 6)]
     assert [batch["x"].shape[0] for batch in batches] == [2, 1, 1]
     assert all(batch["cube_size"].unique().numel() == 1 for batch in batches)
+
+
+def test_spatial_split_has_no_train_val_overlap():
+    """Регрессионный тест к ликеджу: ни один val-патч не должен
+    пространственно пересекаться ни с одним train-патчем (по оси z),
+    в том числе между разными cube_size."""
+    from utils.data import build_patch_index
+
+    shape = (256, 128, 128)
+    frames = [build_patch_index(shape, cs, val_fraction=0.25) for cs in (32, 64)]
+    df = pd.concat(frames, ignore_index=True)
+
+    train = df[df["split"] == "train"]
+    val = df[df["split"] == "val"]
+    assert len(train) > 0 and len(val) > 0
+
+    train_z_end = (train["z"] + train["cube_size"]).max()
+    val_z_start = val["z"].min()
+    # Train-зона целиком до начала val-зоны: перекрытие невозможно
+    assert train_z_end <= val_z_start
+
+
+def test_percolation_labels_matches_simple_cases():
+    from utils.data import percolation_labels
+
+    mask = np.zeros((8, 8, 8), dtype=bool)
+    mask[:, 4, 4] = True  # сквозной канал вдоль z
+    labels = percolation_labels(mask)
+    assert labels.tolist() == [1.0, 0.0, 0.0]
+
+    mask2 = np.zeros((8, 8, 8), dtype=bool)
+    mask2[:4, 4, 4] = True  # обрывается на середине
+    labels2 = percolation_labels(mask2)
+    assert labels2.tolist() == [0.0, 0.0, 0.0]
+
+
+def test_add_aux_targets_streaming_chunks_match_direct(tmp_path):
+    """Потоковая (чанковая) версия add_aux_targets_to_index должна давать
+    те же значения, что и прямой расчёт по кубу, независимо от размера чанка."""
+    import numpy as np
+    import pandas as pd
+
+    from utils.data import add_aux_targets_to_index, percolation_labels
+
+    rng = np.random.default_rng(7)
+    vol = (rng.random((64, 64, 64)) > 0.55).astype(np.uint8)  # 0 = пора
+    size = 32
+    rows = [
+        {"z": z, "y": y, "x": x, "split": "train"}
+        for z in (0, 32)
+        for y in (0, 32)
+        for x in (0, 32)
+    ]
+    df = pd.DataFrame(rows)
+
+    # chunk_memory_mb=1 → чанк больше одного, но меньше всех кубов сразу
+    out = add_aux_targets_to_index(df, vol, size, pore_value=0, num_workers=0, chunk_memory_mb=1)
+
+    for _, row in out.iterrows():
+        z, y, x = int(row.z), int(row.y), int(row.x)
+        cube = vol[z : z + size, y : y + size, x : x + size] == 0
+        assert abs(row.porosity - cube.mean()) < 1e-6
+        ref = percolation_labels(cube)
+        got = np.array([row.percolates_z, row.percolates_y, row.percolates_x])
+        assert np.array_equal(got, ref)

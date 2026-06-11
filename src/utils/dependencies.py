@@ -9,9 +9,14 @@ REQUIRED_PACKAGES = [
     "scipy",
     "skimage",
     "torch",
+    "gudhi",
+]
+
+# porespy/openpnm нужны только для graph-режима scripts/visualize.py
+# (извлечение поровой сети). Сегментационный пайплайн работает без них.
+OPTIONAL_PACKAGES = [
     "porespy",
     "openpnm",
-    "gudhi",
 ]
 
 

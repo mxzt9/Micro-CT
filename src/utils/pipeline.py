@@ -130,12 +130,20 @@ class DigitalCorePipeline:
         self.segmentation_model.eval()
         with torch.no_grad():
             if self.sliding_window_size is not None:
+                # PH считаем для каждого окна отдельно (как в обучении,
+                # где PH per-patch), а не один раз на весь объём.
+                def _window_ph(patch: torch.Tensor) -> torch.Tensor:
+                    patch_np = patch[0, 0].detach().cpu().numpy()
+                    return torch.from_numpy(
+                        cubical_persistence_summary(patch_np, max_size=32).astype(np.float32)
+                    ).unsqueeze(0).to(patch.device)
+
                 logits = sliding_window_inference_3d(
                     self.segmentation_model,
                     tensor,
                     window_size=self.sliding_window_size,
                     overlap=self.sliding_overlap,
-                    ph_features=ph_features,
+                    ph_fn=_window_ph if ph_features is not None else None,
                 )
                 aux_outputs = None
                 embeddings = None
@@ -217,7 +225,18 @@ class DigitalCorePipeline:
         domain_size: tuple[float, float, float] | None = None,
         include_ph: bool = True,
         compute_openpnm_baseline: bool = True,
+        ph_max_size: int | None = 32,
     ) -> PipelineResult:
+        """Полный прогон одного куба.
+
+        Args:
+            ph_max_size: max_size для cubical_persistence_summary.
+                ВАЖНО: должен совпадать со значением topology_max_size при
+                обучении (по умолчанию 32). Раньше тут было min(shape)//2,
+                из-за чего PH-фичи на инференсе имели другой масштаб
+                (счётчики H0/H1 растут с размером решётки) — distribution
+                shift относительно обучения.
+        """
         if input_is_pore_mask:
             pore_mask = np.asarray(cube).astype(bool)
             segmentation = SegmentationResult(
@@ -236,7 +255,7 @@ class DigitalCorePipeline:
             elif raw_np.ndim == 4:
                 raw_np = raw_np[0]
             ph_features = torch.from_numpy(
-                cubical_persistence_summary(raw_np, max_size=min(raw_np.shape) // 2).astype(np.float32)
+                cubical_persistence_summary(raw_np, max_size=ph_max_size).astype(np.float32)
             ).unsqueeze(0).to(self.device)
             segmentation = self.segment_cube(cube, ph_features=ph_features)
             pore_mask = segmentation.mask

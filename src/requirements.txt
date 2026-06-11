@@ -3,12 +3,17 @@ pandas
 scipy
 scikit-image
 matplotlib
+seaborn
 tqdm
+torch
+gudhi
+
+# опционально: 3D-вьюер (scripts/visualize.py)
 pygame
 moderngl
 imgui[pygame]
 PyOpenGL
-torch
+
+# опционально: извлечение поровой сети для graph-режима visualize.py
 porespy
 openpnm
-gudhi
