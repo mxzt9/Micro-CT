@@ -202,9 +202,10 @@ class _AdaptiveRoutedUNet3DBase(nn.Module):
         self.ph_dim = int(ph_dim)
         self.topology_dim = int(topology_dim)
 
-        n.MaxPool3d(2)
-        self.eself.enc1 = ResBlock3D(in_channels, bc)
-        self.pool1 = nnc2 = ResBlock3D(bc, bc * 2)
+        
+        self.enc1 = ResBlock3D(in_channels, bc)
+        self.pool1 = nn.MaxPool3d(2)
+        self.enc2 = ResBlock3D(bc, bc * 2)
         self.pool2 = nn.MaxPool3d(2)
         self.enc3 = ResBlock3D(bc * 2, bc * 4)
         self.pool3 = nn.MaxPool3d(2)
@@ -318,5 +319,4 @@ class TopologyAdaptiveRoutedUNet3D(_AdaptiveRoutedUNet3DBase):
         return super().forward(x, ph_features=ph_features, return_dict=return_dict)
 
 
-# Backward-compatible alias
 AdaptiveRoutedUNet3D = _AdaptiveRoutedUNet3DBase
